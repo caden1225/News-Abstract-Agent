@@ -1,0 +1,5 @@
+name: llm-skeleton-test
+image: ebanma/llm-agent:llm-skeleton-test_latest
+extra_args:
+  - "-p 8080:8080"
+  - "-v $HOME/.zebrax:/root/.zebrax"
