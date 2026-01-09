@@ -19,12 +19,12 @@ function usage() {
 function precheck() {
   issue_found=false
   if ! which zbxctl >/dev/null 2>&1; then
-    echo "error: zbxctl not installed, please install it first, see "
+    echo "error: zbxctl not installed, please install it first"
     issue_found=true
   fi
 
   if [[ ! -f $HOME/.zebrax/config.yaml ]]; then
-    echo "error: zbxctl is not logged into the yuanqi platform, please login first, refer to: "
+    echo "error: zbxctl is not logged into the yuanqi platform, please login first"
     issue_found=true
   fi
 
@@ -69,8 +69,8 @@ function init_env() {
     fi
   else
     echo "file $APP_INFO_FILE not found. please init app first by running '$ME init-app <your_app_id>'"
-        exit 1
-    fi
+    exit 1
+  fi
 
   if [[ -f .devctl.env ]]; then
     source .devctl.env
@@ -78,6 +78,13 @@ function init_env() {
 
   ZBXCTL_CMD="${ZBXCTL_CMD:-zbxctl}"
   ZBXCTL_CFG="${ZBXCTL_CFG:-${HOME}/.zebrax/config.yaml}"
+  
+  # 确保 PATH 包含 zbxctl 可能存在的目录
+  if ! command -v $ZBXCTL_CMD >/dev/null 2>&1; then
+    if [[ -d "$HOME/.local/bin" ]]; then
+      export PATH="$HOME/.local/bin:$PATH"
+    fi
+  fi
 
 }
 
@@ -174,7 +181,6 @@ function build_docker() {
 
     echo
     echo "start deploying app $APP_ID"
-    echo "deploy_cmd: $deploy_cmd"
     eval $deploy_cmd
   fi
 }
@@ -190,13 +196,13 @@ function check_uncommitted_changes() {
 }
 
 function check_sidecar_status {
-    CHECK_URL="http://localhost:13984/status.zebra"
+  CHECK_URL="http://localhost:13984/status.zebra"
   HTTP_STATUS=$(curl -o /dev/null -s -w "%{http_code}\n" $CHECK_URL)
   if [ "$HTTP_STATUS" -eq "200" ]; then
-        return 0
-    else
-        return 1
-    fi
+    return 0
+  else
+    return 1
+  fi
 }
 
 function sidecar_usage() {
@@ -207,8 +213,7 @@ function sidecar_usage() {
 function sidecar() {
   if [[ $# == 0 ]]; then
     sidecar_usage
-        return 0
-    fi
+  fi
 
   case $1 in
   start)
@@ -242,7 +247,7 @@ function sidecar() {
 function stop_sidecar() {
   # Find the PID(s) of the process 'zbxctl llm sidecar'
   set +e
-    PIDS=$(pgrep -f 'zbxctl llm sidecar')
+  PIDS=$(pgrep -f 'zbxctl llm sidecar')
 
   if [[ -z $PIDS ]]; then
     echo "llm sidecar server is not running"
@@ -257,20 +262,41 @@ function start_sidecar_v2() {
   CHECK_URL="http://localhost:13984/status.zebra"
   LOG_FILE="logs/sidecar.log"
   mkdir -p logs
+  # 确保日志文件可写（如果文件存在且不可写，则删除）
+  if [[ -f "$LOG_FILE" && ! -w "$LOG_FILE" ]]; then
+    echo "warning: $LOG_FILE exists but is not writable, removing it..."
+    rm -f "$LOG_FILE" 2>/dev/null || {
+      echo "error: cannot remove $LOG_FILE, please check permissions"
+      return 1
+    }
+  fi
+  # 确保使用完整路径或确保 PATH 包含 zbxctl 所在目录
+  if ! command -v $ZBXCTL_CMD >/dev/null 2>&1; then
+    # 如果 zbxctl 不在 PATH 中，尝试使用完整路径
+    if [[ -f "$HOME/.local/bin/zbxctl" ]]; then
+      ZBXCTL_CMD="$HOME/.local/bin/zbxctl"
+    elif [[ -f "/usr/local/bin/zbxctl" ]]; then
+      ZBXCTL_CMD="/usr/local/bin/zbxctl"
+    else
+      echo "error: zbxctl not found in PATH or common locations"
+      echo "please ensure zbxctl is installed and in your PATH"
+      return 1
+    fi
+  fi
   START_COMMAND="LLM_ENV=${LLM_ENV:-dev} LLM_AGENT_ENV=${LLM_AGENT_ENV:-default} LLM_APP_ID=$APP_ID LLM_USE_CONFIG_API=1 $ZBXCTL_CMD llm sidecar --debug --config $ZBXCTL_CFG"
 
   # 检查 URL 是否可访问
-    if check_sidecar_status; then
+  if check_sidecar_status; then
     echo "sidecar is already running"
-        return 0
-    else
+    return 0
+  else
     echo "starting the sidecar service..."
     echo "cmd = $START_COMMAND"
 
     # 执行启动命令
-    eval $START_COMMAND >$LOG_FILE 2>&1 &
+    eval $START_COMMAND >"$LOG_FILE" 2>&1 &
     START_PID=$!
-    fi
+  fi
 
   # 等待 URL 可访问
   until check_sidecar_status; do
@@ -315,8 +341,8 @@ sidecar)
   shift 1
   sidecar $@
   ;;
-      *)
+*)
   echo "unknown command: $1"
-    usage
-    ;;
+  usage
+  ;;
 esac

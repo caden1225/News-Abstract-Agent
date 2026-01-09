@@ -3,13 +3,13 @@
 
 llm:
   # Sidecar 服务地址（OpenAI 兼容 API）
-  base_url: http://localhost:13984/api/llm/v1
+  base_url: http://10.109.253.54:8001/v1
 
   # API 密钥（从环境变量读取）
   api_key: ${LLM_API_KEY}
 
   # 模型配置
-  summarizer_model: qwen2-7b
+  summarizer_model: Qwen2.5-7B-Instruct
 
   # 超时配置（秒）
   timeout: 30

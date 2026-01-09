@@ -1,0 +1,14 @@
+curl -X POST http://10.109.253.54:8001/api/llm/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen2.5-7B-Instruct",
+    "messages": [
+      {
+        "role": "user",
+        "content": "你好，请介绍一下你自己"
+      }
+    ],
+    "temperature": 0.7,
+    "max_tokens": 1000,
+    "think": true
+  }'
