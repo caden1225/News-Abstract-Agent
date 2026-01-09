@@ -3,10 +3,15 @@
 实现当日热点新闻抓取、摘要生成和TTS语音播报
 与Java脚手架API完全兼容
 """
-from fastapi import FastAPI, Request, HTTPException
+import sys
+from pathlib import Path
+
+# 添加当前目录到 Python 路径
+sys.path.insert(0, str(Path(__file__).parent))
+
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 import json
 import time
 import asyncio
@@ -17,6 +22,10 @@ import os
 from news_scraper import NewsScraper
 from news_summarizer import NewsSummarizer
 from tts_service import TTSService, MockTTSService
+from models import (
+    AgentRequest, ResponseData, BaseResponse,
+    FramePart, FramePartAudio
+)
 
 # 配置日志
 logging.basicConfig(
@@ -28,13 +37,12 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="News TTS Agent", version="1.0.0")
 
 # ==================== 配置 ====================
-SIDECAR_BASE_URL = os.getenv("SIDECAR_BASE_URL", "http://localhost:13984/api/llm/v1")
-LLM_API_KEY = os.getenv("LLM_API_KEY", "zbx:...")
 USE_MOCK_TTS = os.getenv("USE_MOCK_TTS", "true").lower() == "true"
+TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
 
 # ==================== 初始化服务 ====================
 news_scraper = NewsScraper()
-news_summarizer = NewsSummarizer(sidecar_base_url=SIDECAR_BASE_URL, api_key=LLM_API_KEY)
+news_summarizer = NewsSummarizer()  # 使用新的初始化方式，从配置文件读取
 
 # 根据配置选择TTS服务
 if USE_MOCK_TTS:
@@ -43,60 +51,84 @@ if USE_MOCK_TTS:
 else:
     tts_service = TTSService()
 
-# ==================== 数据模型定义 ====================
-
-class AgentRequest(BaseModel):
-    """请求模型 - 与Java脚手架保持一致"""
-    version: str
-    channel_id: str
-    request_id: str
-    timestamp: int
-    vin: str
-    stream: bool
-    user_id: str
-    query: str
-    conversation_id: Optional[str] = None
-    history: Optional[List] = None
-    context: Optional[Dict[str, Any]] = None
-    agent_id: Optional[str] = None
-    rewritten_query: Optional[str] = None
-    debug: Optional[bool] = False
-    system_metadata: Optional[Dict[str, Any]] = None
-
-
-class AgentResponse(BaseModel):
-    """响应数据模型 - 与Java脚手架保持一致"""
-    request_id: str
-    user_id: str
-    vin: str
-    frame_id: int
-    frame_text: str
-    frame_timestamp: int
-    frame_is_final: bool
-    complete_content: Optional[str] = None
-    agent_id: Optional[str] = None
-    nlu: Optional[Dict[str, Any]] = None
-    function_call: Optional[Dict[str, Any]] = None
-    extension: Optional[Dict[str, Any]] = None
-    frame_parts: Optional[List] = None
-    frame_voice: Optional[Dict[str, Any]] = None
-    frame_image: Optional[Dict[str, Any]] = None
-    usage: Optional[Dict[str, Any]] = None
-    scene_id: Optional[str] = None
-    debug_info: Optional[Dict[str, Any]] = None
-
-
-class BaseResponse(BaseModel):
-    """基础响应模型 - 与Java脚手架保持一致"""
-    code: int
-    message: str
-    data: AgentResponse
-    event: Optional[str] = None
-    request_id: Optional[str] = None
-    version: Optional[str] = None
-
-
 # ==================== Agent业务逻辑 ====================
+
+def generate_mock_response(query: str) -> Dict[str, Any]:
+    """
+    生成测试用的假数据响应
+
+    Args:
+        query: 用户查询
+
+    Returns:
+        包含假新闻和音频的响应字典
+    """
+    import base64
+
+    # 假新闻数据
+    mock_news_list = [
+        {
+            "title": "人工智能技术取得重大突破",
+            "summary": "近日，国际顶级AI研究团队发布新一代大语言模型，在多项基准测试中刷新纪录",
+            "ai_summary": "新一代AI模型性能提升显著，推理速度提高300%，能耗降低40%",
+            "source": "科技日报",
+            "publish_time": "2025-01-09 10:30",
+            "url": "https://example.com/news/ai-breakthrough"
+        },
+        {
+            "title": "全球新能源汽车销量创新高",
+            "summary": "2024年全球新能源汽车销量突破1500万辆，同比增长35%",
+            "ai_summary": "中国市场继续领跑，欧洲市场增速迅猛，技术创新推动产业发展",
+            "source": "经济观察报",
+            "publish_time": "2025-01-09 09:15",
+            "url": "https://example.com/news/ev-sales"
+        },
+        {
+            "title": "量子计算实现商用里程碑",
+            "summary": "首台商用量子计算机正式交付，将用于金融建模和药物研发",
+            "ai_summary": "量子计算正式进入应用阶段，算力优势将在多个领域发挥作用",
+            "source": "科技周刊",
+            "publish_time": "2025-01-09 08:45",
+            "url": "https://example.com/news/quantum-computing"
+        }
+    ]
+
+    # 根据查询生成不同的播报稿
+    if "头条" in query or "热点" in query:
+        mock_report = """各位听众好，以下是今日热点新闻：
+
+第一，人工智能技术取得重大突破。国际顶级AI研究团队发布新一代大语言模型，推理速度提高300%，能耗降低40%。
+
+第二，全球新能源汽车销量创新高。2024年全球销量突破1500万辆，同比增长35%，中国市场继续领跑。
+
+第三，量子计算实现商用里程碑。首台商用量子计算机正式交付，将用于金融建模和药物研发。
+
+以上就是今日热点新闻，感谢收听。"""
+    else:
+        mock_report = f"""收到您的查询：{query}
+
+为您播报今日新闻摘要：
+
+科技方面，人工智能技术取得重大突破，新一代大语言模型性能显著提升。
+
+经济方面，全球新能源汽车销量创新高，2024年销量突破1500万辆。
+
+前沿科技方面，量子计算实现商用里程碑，正式进入应用阶段。
+
+感谢您的收听，如需了解更多详情，请随时提问。"""
+
+    # 生成假音频数据（一个简短的WAV文件头）
+    # 这里只生成一个小的base64字符串作为演示
+    mock_audio_wav = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x44\xAC\x00\x00\x88\x58\x01\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+    mock_audio_base64 = base64.b64encode(mock_audio_wav).decode('utf-8')
+
+    return {
+        "text": mock_report,
+        "news_count": len(mock_news_list),
+        "audio": mock_audio_base64,
+        "news_list": mock_news_list
+    }
+
 
 async def process_news_query(query: str, context: Optional[Dict] = None) -> Dict[str, Any]:
     """
@@ -110,6 +142,11 @@ async def process_news_query(query: str, context: Optional[Dict] = None) -> Dict
         处理结果字典,包含新闻列表、播报稿和音频
     """
     logger.info(f"开始处理新闻查询: {query}")
+
+    # ==================== 测试模式：返回假数据 ====================
+    if TEST_MODE:
+        logger.info("🧪 测试模式：返回假数据")
+        return generate_mock_response(query)
 
     # 步骤1: 抓取当日热点新闻
     logger.info("步骤1: 抓取当日热点新闻...")
@@ -189,6 +226,41 @@ async def health_check():
     }
 
 
+@app.get("/health/sidecar")
+async def check_sidecar():
+    """检查 Sidecar 健康状态"""
+    import httpx
+    from llm_utils.config import config
+
+    sidecar_url = config.get_value("llm.base_url", "http://localhost:13984/api/llm/v1")
+    health_url = sidecar_url.replace("/api/llm/v1", "/status.zebra")
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(health_url)
+            if response.status_code == 200:
+                return {
+                    "status": "healthy",
+                    "sidecar_url": sidecar_url,
+                    "health_url": health_url,
+                    "message": "Sidecar is running"
+                }
+            else:
+                return {
+                    "status": "unhealthy",
+                    "sidecar_url": sidecar_url,
+                    "health_url": health_url,
+                    "message": f"Sidecar returned {response.status_code}"
+                }
+    except Exception as e:
+        return {
+            "status": "error",
+            "sidecar_url": sidecar_url,
+            "health_url": health_url,
+            "message": str(e)
+        }
+
+
 @app.get("/api/v1/news")
 async def get_news():
     """
@@ -219,6 +291,7 @@ async def chat(request: AgentRequest):
 
     async def generate_response():
         """生成流式响应"""
+        start_time = time.time()
         try:
             frame_index = 0
             current_timestamp = int(time.time() * 1000)
@@ -227,6 +300,9 @@ async def chat(request: AgentRequest):
             result = await process_news_query(request.query, request.context)
             response_text = result["text"]
             audio_base64 = result.get("audio")
+            
+            # 计算处理时间
+            total_time = int((time.time() - start_time) * 1000)
 
             if request.stream:
                 # 流式发送响应(模拟打字效果)
@@ -234,22 +310,19 @@ async def chat(request: AgentRequest):
                 words = list(response_text)
                 for word in words:
                     complete_content += word
-                    response = AgentResponse(
-                        request_id=request.request_id,
-                        user_id=request.user_id,
-                        vin=request.vin,
+                    response_data = ResponseData(
                         frame_id=frame_index,
-                        frame_text=complete_content,
                         frame_timestamp=current_timestamp,
-                        frame_is_final=False,
-                        agent_id=request.agent_id
+                        frame_text=complete_content,
+                        frame_is_final=False
                     )
 
                     base_response = BaseResponse(
+                        version=request.version,
+                        request_id=request.request_id,
                         code=0,
-                        message="Success",
-                        data=response,
-                        request_id=request.request_id
+                        message="success",
+                        data=response_data
                     )
 
                     yield f"event:data\ndata:{json.dumps(base_response.dict(exclude_none=True), ensure_ascii=False)}\n\n"
@@ -257,74 +330,124 @@ async def chat(request: AgentRequest):
                     await asyncio.sleep(0.02)  # 控制发送频率
 
                 # 发送完成帧(包含音频数据)
-                final_response = AgentResponse(
-                    request_id=request.request_id,
-                    user_id=request.user_id,
-                    vin=request.vin,
+                # 构建调试信息
+                debug_info = None
+                if request.debug:
+                    debug_info = {
+                        "request": {
+                            "debug": request.debug,
+                            "query": request.query,
+                            "history": [h.dict() if hasattr(h, 'dict') else h for h in (request.history or [])],
+                            "version": request.version,
+                            "voice_zone": request.voice_zone,
+                            "stream": request.stream,
+                            "user_id": request.user_id,
+                            "conversation_id": request.conversation_id,
+                            "vin": request.vin,
+                            "channel_id": request.channel_id,
+                            "request_id": request.request_id,
+                            "timestamp": request.timestamp
+                        },
+                        "totalTime": total_time
+                    }
+                
+                # 构建 frame_parts（如果有音频）
+                frame_parts = None
+                if audio_base64:
+                    frame_parts = [
+                        FramePart(
+                            type="audio",
+                            audio=FramePartAudio(
+                                format="wav",
+                                data=f"data:;base64,{audio_base64}",
+                                is_final=True
+                            )
+                        )
+                    ]
+                
+                final_response_data = ResponseData(
                     frame_id=frame_index,
-                    frame_text="",
                     frame_timestamp=int(time.time() * 1000),
+                    frame_text="",
                     frame_is_final=True,
                     complete_content=complete_content,
-                    agent_id=request.agent_id
+                    frame_parts=frame_parts,
+                    debug_info=debug_info
                 )
-
-                # 如果有音频数据,添加到响应中
-                if audio_base64:
-                    final_response.frame_voice = {
-                        "audio": audio_base64,
-                        "format": "mp3"
-                    }
             else:
                 # 非流式响应
                 # 发送内容帧
-                response = AgentResponse(
-                    request_id=request.request_id,
-                    user_id=request.user_id,
-                    vin=request.vin,
+                response_data = ResponseData(
                     frame_id=frame_index,
-                    frame_text=response_text,
                     frame_timestamp=current_timestamp,
-                    frame_is_final=False,
-                    agent_id=request.agent_id
+                    frame_text=response_text,
+                    frame_is_final=False
                 )
 
                 base_response = BaseResponse(
+                    version=request.version,
+                    request_id=request.request_id,
                     code=0,
-                    message="Success",
-                    data=response,
-                    request_id=request.request_id
+                    message="success",
+                    data=response_data
                 )
 
                 yield f"event:data\ndata:{json.dumps(base_response.dict(exclude_none=True), ensure_ascii=False)}\n\n"
                 frame_index += 1
 
                 # 发送完成帧
-                final_response = AgentResponse(
-                    request_id=request.request_id,
-                    user_id=request.user_id,
-                    vin=request.vin,
+                # 构建调试信息
+                debug_info = None
+                if request.debug:
+                    debug_info = {
+                        "request": {
+                            "debug": request.debug,
+                            "query": request.query,
+                            "history": [h.dict() if hasattr(h, 'dict') else h for h in (request.history or [])],
+                            "version": request.version,
+                            "voice_zone": request.voice_zone,
+                            "stream": request.stream,
+                            "user_id": request.user_id,
+                            "conversation_id": request.conversation_id,
+                            "vin": request.vin,
+                            "channel_id": request.channel_id,
+                            "request_id": request.request_id,
+                            "timestamp": request.timestamp
+                        },
+                        "totalTime": total_time
+                    }
+                
+                # 构建 frame_parts（如果有音频）
+                frame_parts = None
+                if audio_base64:
+                    frame_parts = [
+                        FramePart(
+                            type="audio",
+                            audio=FramePartAudio(
+                                format="wav",
+                                data=f"data:;base64,{audio_base64}",
+                                is_final=True
+                            )
+                        )
+                    ]
+                
+                final_response_data = ResponseData(
                     frame_id=frame_index,
-                    frame_text="",
                     frame_timestamp=int(time.time() * 1000),
+                    frame_text="",
                     frame_is_final=True,
                     complete_content=response_text,
-                    agent_id=request.agent_id
+                    frame_parts=frame_parts,
+                    debug_info=debug_info
                 )
-
-                # 如果有音频数据,添加到响应中
-                if audio_base64:
-                    final_response.frame_voice = {
-                        "audio": audio_base64,
-                        "format": "mp3"
-                    }
 
             # 发送最终响应
             final_base_response = BaseResponse(
+                version=request.version,
+                request_id=request.request_id,
                 code=0,
-                message="Success",
-                data=final_response,
-                request_id=request.request_id
+                message="success",
+                data=final_response_data
             )
 
             yield f"event:data\ndata:{json.dumps(final_base_response.dict(exclude_none=True), ensure_ascii=False)}\n\n"
@@ -332,22 +455,19 @@ async def chat(request: AgentRequest):
         except Exception as e:
             logger.error(f"处理请求失败: {e}", exc_info=True)
             # 发送错误响应
-            error_response = AgentResponse(
-                request_id=request.request_id,
-                user_id=request.user_id,
-                vin=request.vin,
+            error_response_data = ResponseData(
                 frame_id=0,
-                frame_text="",
                 frame_timestamp=int(time.time() * 1000),
-                frame_is_final=True,
-                complete_content=None
+                frame_text="",
+                frame_is_final=True
             )
 
             error_base_response = BaseResponse(
+                version=request.version,
+                request_id=request.request_id,
                 code=500,
                 message=f"Internal Error: {str(e)}",
-                data=error_response,
-                request_id=request.request_id
+                data=error_response_data
             )
 
             yield f"event:data\ndata:{json.dumps(error_base_response.dict(exclude_none=True), ensure_ascii=False)}\n\n"

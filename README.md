@@ -34,11 +34,40 @@ news-tts-agent/
 
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
+| `TEST_MODE` | **是否使用测试模式（假数据）** | `false` |
 | `SIDECAR_BASE_URL` | Sidecar服务地址 | `http://localhost:13984/api/llm/v1` |
 | `LLM_API_KEY` | LLM API密钥 | `zbx:...` |
 | `LLM_MODEL_ALIAS` | 模型别名 | `qwen2-7b` |
 | `TTS_SERVICE_URL` | TTS服务地址 | `http://localhost:13984/api/llm/v1/tts` |
 | `USE_MOCK_TTS` | 是否使用Mock TTS | `true` |
+
+**重要提示**: 部署到管理平台测试时，强烈建议设置 `TEST_MODE=true`，这样无需配置任何外部服务即可正常工作。
+
+## 快速开始（推荐）
+
+### 方式一：一键部署脚本
+
+```bash
+# 使用部署脚本（自动启动测试模式）
+./deploy.sh
+```
+
+### 方式二：手动启动
+
+```bash
+# 安装依赖
+pip install -r requirements.txt
+
+# 启动服务（测试模式）
+TEST_MODE=true python main.py
+```
+
+### 运行测试
+
+```bash
+# 运行平台测试脚本
+python test_platform_chat.py
+```
 
 ## 本地开发
 
@@ -73,6 +102,38 @@ python main.py
 应用将在 `http://localhost:8080` 启动
 
 ### 4. 测试API
+
+## 测试模式说明
+
+当 `TEST_MODE=true` 时，服务会返回预定义的假数据，无需依赖外部服务（如RSS、LLM、TTS等）。**强烈推荐在部署到管理平台进行测试时使用此模式**。
+
+**假数据内容**：
+- **新闻1**: 人工智能技术取得重大突破
+- **新闻2**: 全球新能源汽车销量创新高
+- **新闻3**: 量子计算实现商用里程碑
+
+**测试脚本**：
+```bash
+# 运行完整测试套件
+python test_platform_chat.py
+
+# 运行单个测试
+python test_platform_chat.py single "今天有什么新闻"
+```
+
+测试脚本会模拟管理平台的chat接口调用，验证：
+- ✅ 接口连通性
+- ✅ 流式响应正确性
+- ✅ 响应数据结构符合LLM Protocol 2.1
+- ✅ 包含完整的文本内容
+- ✅ 包含音频数据
+- ✅ 调试信息完整
+
+## 详细文档
+
+完整的部署文档请参考：[DEPLOYMENT.md](DEPLOYMENT.md)
+
+## 本地开发（完整功能）
 
 #### 健康检查
 ```bash

@@ -1,40 +1,26 @@
 """
 新闻摘要模块
-使用大语言模型生成新闻摘要
+使用大语言模型生成新闻摘要（通过 Sidecar）
 """
 import logging
 from typing import List, Dict
-from openai import AsyncOpenAI
-import os
+from llm_utils.llm_service import LLMService
+from llm_utils.config import config
 
 logger = logging.getLogger(__name__)
 
 
 class NewsSummarizer:
-    """新闻摘要生成器 - 使用LLM生成摘要"""
+    """新闻摘要生成器 - 通过 Sidecar 调用 LLM"""
 
-    def __init__(self, sidecar_base_url: str = None, api_key: str = None):
+    def __init__(self):
         """
         初始化摘要生成器
-
-        Args:
-            sidecar_base_url: Sidecar服务地址
-            api_key: API密钥
+        从配置文件读取模型别名
         """
-        self.sidecar_base_url = sidecar_base_url or os.getenv(
-            "SIDECAR_BASE_URL",
-            "http://localhost:13984/api/llm/v1"
-        )
-        self.api_key = api_key or os.getenv("LLM_API_KEY", "zbx:...")
-
-        # 初始化OpenAI客户端(连接到Sidecar)
-        self.client = AsyncOpenAI(
-            api_key=self.api_key,
-            base_url=self.sidecar_base_url
-        )
-
-        # 默认使用的模型别名(需要在平台注册)
-        self.model_alias = os.getenv("LLM_MODEL_ALIAS", "qwen2-7b")
+        # 从配置读取模型别名
+        self.model_alias = config.get("llm.summarizer_model", "qwen2-7b")
+        logger.info(f"NewsSummarizer initialized with model: {self.model_alias}")
 
     async def summarize_single_news(self, news_item: Dict) -> str:
         """
@@ -64,20 +50,19 @@ class NewsSummarizer:
                 {"role": "user", "content": prompt}
             ]
 
-            # 调用LLM生成摘要
-            response = await self.client.chat.completions.create(
-                model=self.model_alias,
+            # 通过 LLMService 调用 Sidecar
+            summary = await LLMService.call_llm(
+                model_name=self.model_alias,
                 messages=messages,
                 temperature=0.7,
                 max_tokens=200
             )
 
-            summary = response.choices[0].message.content.strip()
-            logger.info(f"为新闻生成摘要成功: {news_item.get('title', '')[:50]}")
-            return summary
+            logger.info(f"Summary generated for: {news_item.get('title', '')[:50]}")
+            return summary.strip()
 
         except Exception as e:
-            logger.error(f"生成摘要失败: {e}", exc_info=True)
+            logger.error(f"Summarization failed: {e}", exc_info=True)
             # 降级处理:返回原始摘要的前100字
             original_summary = news_item.get('summary', '')
             return original_summary[:100] if original_summary else "暂无摘要"
@@ -136,20 +121,19 @@ class NewsSummarizer:
                 {"role": "user", "content": prompt}
             ]
 
-            # 调用LLM生成播报稿
-            response = await self.client.chat.completions.create(
-                model=self.model_alias,
+            # 通过 LLMService 调用 Sidecar 生成播报稿
+            report = await LLMService.call_llm(
+                model_name=self.model_alias,
                 messages=messages,
                 temperature=0.7,
                 max_tokens=500
             )
 
-            report = response.choices[0].message.content.strip()
-            logger.info("生成新闻播报稿成功")
-            return report
+            logger.info("News report generated successfully")
+            return report.strip()
 
         except Exception as e:
-            logger.error(f"生成播报稿失败: {e}", exc_info=True)
+            logger.error(f"Report generation failed: {e}", exc_info=True)
             # 降级处理:简单的新闻列表
             report_parts = ["各位听众好,以下是今日热点新闻:"]
             for i, news in enumerate(news_list[:5], 1):

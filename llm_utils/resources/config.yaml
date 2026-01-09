@@ -1,0 +1,50 @@
+# news-tts-agent 配置文件
+# 支持 ${VAR_NAME} 格式的环境变量替换
+
+llm:
+  # Sidecar 服务地址（OpenAI 兼容 API）
+  base_url: http://localhost:13984/api/llm/v1
+
+  # API 密钥（从环境变量读取）
+  api_key: ${LLM_API_KEY}
+
+  # 模型配置
+  summarizer_model: qwen2-7b
+
+  # 超时配置（秒）
+  timeout: 30
+
+tts:
+  # TTS 服务地址（也通过 Sidecar）
+  service_url: http://localhost:13984/api/llm/v1/tts
+  enabled: true
+  mock_mode: false
+
+# 新闻源配置
+news:
+  sources:
+    - name: "百度新闻"
+      url: "https://news.baidu.com/ns?word=&tn=news&rtt=1&bsst=1&cl=2&xref=http://www.baidu.com"
+    - name: "新浪新闻"
+      url: "https://news.sina.com.cn/sroll/index.shtml"
+    - name: "网易新闻"
+      url: "http://news.163.com/special/0001386I/ranking_news.xml"
+    - name: "头条RSS"
+      url: "https://www.toutiao.com/rss/news/"
+    - name: "中国新闻网"
+      url: "http://www.chinanews.com/rss/rss_focu.xml"
+
+  # 抓取限制
+  max_news_per_source: 10
+  cache_ttl: 3600  # 缓存1小时
+
+# API 配置
+api:
+  host: 0.0.0.0
+  port: 8080
+  debug: false
+
+# 日志配置
+logging:
+  level: INFO
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
