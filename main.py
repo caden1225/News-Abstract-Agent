@@ -75,12 +75,15 @@ except Exception as e:
     _modelscope_cache_dir = None
 
 from fastapi import FastAPI, HTTPException
+from starlette.requests import Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from core.orchestrator import NewsAgentOrchestrator
 from models.api import ChatRequest, HealthResponse
 from scheduler.tasks import NewsScheduler
+from core.rate_limit import limiter, rate_limit_exceeded_handler, rate_limit_default
+from slowapi.errors import RateLimitExceeded
 
 # ==================== 日志配置 ====================
 
@@ -307,6 +310,15 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# 注册速率限制器
+app.state.limiter = limiter
+
+# 注册速率限制异常处理器
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """速率限制异常处理器"""
+    return rate_limit_exceeded_handler(request, exc)
+
 # CORS 配置
 app.add_middleware(
     CORSMiddleware,
@@ -354,7 +366,8 @@ async def health_check():
 
 
 @app.post("/api/v1/chat", tags=["新闻"])
-async def chat(request: ChatRequest):
+@rate_limit_default(limit="10/minute")  # 速率限制：每分钟10次请求
+async def chat(request: Request, chat_request: ChatRequest):
     """
     新闻查询接口
 
@@ -371,15 +384,15 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=503, detail="服务未就绪")
 
     # 生成请求ID
-    request_id = request.request_id or generate_request_id()
+    request_id = chat_request.request_id or generate_request_id()
 
-    logger.info(f"收到请求: request_id={request_id}, query={request.query}, stream={request.stream}")
+    logger.info(f"收到请求: request_id={request_id}, query={chat_request.query}, stream={chat_request.stream}")
 
     try:
-        if request.stream:
+        if chat_request.stream:
             # 流式响应（SSE）
             return StreamingResponse(
-                stream_chat(request.query, request_id),
+                stream_chat(chat_request.query, request_id),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -388,7 +401,7 @@ async def chat(request: ChatRequest):
             )
         else:
             # 非流式响应（等待完整结果）
-            result = await get_chat_result(request.query, request_id)
+            result = await get_chat_result(chat_request.query, request_id)
             return result
 
     except Exception as e:
@@ -479,7 +492,8 @@ async def get_chat_result(query: str, request_id: str):
 
 
 @app.post("/api/v1/news/summary", tags=["新闻"])
-async def news_summary(request: ChatRequest):
+@rate_limit_default(limit="20/minute")  # 速率限制：每分钟20次请求（摘要接口更宽松）
+async def news_summary(request: Request, chat_request: ChatRequest):
     """
     新闻摘要接口（简化版，只返回文本）
 
@@ -488,18 +502,18 @@ async def news_summary(request: ChatRequest):
     if not orchestrator:
         raise HTTPException(status_code=503, detail="服务未就绪")
 
-    request_id = request.request_id or generate_request_id()
+    request_id = chat_request.request_id or generate_request_id()
 
     try:
         # 获取完整结果
-        result = await get_chat_result(request.query, request_id)
+        result = await get_chat_result(chat_request.query, request_id)
 
         # 空值检查
         if result is None:
             logger.warning("获取摘要结果为空")
             return {
                 "request_id": request_id,
-                "query": request.query,
+                "query": chat_request.query,
                 "summary": "",
                 "news_count": 0
             }
@@ -512,7 +526,7 @@ async def news_summary(request: ChatRequest):
 
         return {
             "request_id": request_id,
-            "query": request.query,
+            "query": chat_request.query,
             "summary": summary_text,
             "news_count": news_count
         }
