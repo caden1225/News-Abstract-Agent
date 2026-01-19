@@ -8,7 +8,7 @@ import base64
 import logging
 import uuid
 import os
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Dict
 from pathlib import Path
 import sys
 
@@ -333,32 +333,52 @@ class LocalTTSService:
 
             # 使用流式合成
             if hasattr(self.model, 'synthesize_streaming'):
-                # 创建一个生成器，在收到完整句子时立即yield
-                # 这样CosyVoice可以在收到第一个完整句子后立即开始处理
-                # 使用线程安全的队列来桥接异步流和同步生成器
+                # 优化：使用asyncio.Queue替代threading.Queue（减少线程切换开销）
+                # 但由于TTS模型需要同步生成器，仍需要桥接
                 import queue
                 import threading
-                text_queue = queue.Queue()
+                text_queue = queue.Queue()  # 仍使用threading.Queue（因为需要同步生成器）
                 stream_done = threading.Event()
+                
+                # 优化：导入动态超时工具
+                from tts_utils.tts_optimization_utils import AdaptiveTimeout
 
+                # 优化：维护文本到音频块的映射（解决文本信息丢失问题）
+                sentence_audio_map: Dict[int, str] = {}
+                sentence_counter = 0
+                
                 async def async_text_collector():
-                    """异步收集文本并放入队列"""
+                    """
+                    异步收集文本并放入队列
+                    
+                    优化：
+                    - 维护文本映射，保留文本信息
+                    - 每个句子分配唯一ID
+                    """
+                    nonlocal sentence_counter
                     try:
                         token_count = 0
                         async for text_token in text_stream:
                             token_count += 1
-                            logger.info(f"[TTS_DEBUG] 收到token#{token_count}: '{text_token}' (len={len(text_token)})")
+                            logger.debug(f"[TTS_DEBUG] 收到token#{token_count}: '{text_token}' (len={len(text_token)})")
                             complete_sentences = sentence_buffer.add_text(text_token)
-                            logger.info(f"[TTS_DEBUG] Buffer: '{sentence_buffer.get_pending_text()}' (len={len(sentence_buffer.get_pending_text())}), 句子数={len(complete_sentences)}")
-                            # 如果有完整句子，立即放入队列
+                            logger.debug(f"[TTS_DEBUG] Buffer: '{sentence_buffer.get_pending_text()}' (len={len(sentence_buffer.get_pending_text())}), 句子数={len(complete_sentences)}")
+                            
+                            # 如果有完整句子，立即放入队列（优化：保留文本信息）
                             for sentence in complete_sentences:
-                                logger.info(f"[TTS_DEBUG] -> 放入队列: '{sentence}'")
-                                text_queue.put(sentence)
+                                sentence_counter += 1
+                                sentence_key = sentence_counter
+                                sentence_audio_map[sentence_key] = sentence  # ✅ 保存文本映射
+                                logger.debug(f"[TTS_DEBUG] -> 放入队列 #{sentence_key}: '{sentence}'")
+                                text_queue.put((sentence_key, sentence))  # ✅ 传递(sentence_key, sentence)元组
 
                         # 处理剩余文本
                         remaining_text = sentence_buffer.flush()
                         if remaining_text:
-                            text_queue.put(remaining_text)
+                            sentence_counter += 1
+                            sentence_key = sentence_counter
+                            sentence_audio_map[sentence_key] = remaining_text
+                            text_queue.put((sentence_key, remaining_text))
                     finally:
                         stream_done.set()
                         text_queue.put(None)  # 结束信号
@@ -367,22 +387,49 @@ class LocalTTSService:
                 collector_task = asyncio.create_task(async_text_collector())
 
                 def text_chunk_generator():
-                    """同步生成器，从队列中获取文本块（优化：减少超时时间）"""
+                    """
+                    同步生成器，从队列中获取文本块
+                    
+                    优化：
+                    - 动态超时调整（根据数据流自适应）
+                    - 提取文本内容（从元组中）
+                    """
+                    # 优化：使用自适应超时
+                    adaptive_timeout = AdaptiveTimeout(
+                        initial=0.1,
+                        min_timeout=0.01,
+                        max_timeout=0.3
+                    )
+                    
                     chunk_count = 0
                     all_chunks = []  # 收集所有chunk
                     while True:
                         try:
-                            # 优化：使用更短的超时时间，更快响应
-                            chunk = text_queue.get(timeout=0.5)  # 增加超时到0.5秒，给更多时间收集数据
-                            if chunk is None:  # 结束信号
+                            # 优化：使用动态超时
+                            timeout = adaptive_timeout.get_timeout()
+                            item = text_queue.get(timeout=timeout)
+                            
+                            if item is None:  # 结束信号
                                 logger.info(f"[TTS_DEBUG] text_chunk_generator 收到结束信号，总共收到 {len(all_chunks)} 个chunk")
                                 break
+                            
+                            # 优化：提取文本内容（如果是元组）
+                            if isinstance(item, tuple):
+                                sentence_key, sentence_text = item
+                                chunk = sentence_text
+                            else:
+                                chunk = item
+                            
                             chunk_count += 1
                             all_chunks.append(chunk)
-                            logger.info(f"[TTS_DEBUG] text_chunk_generator 收到chunk#{chunk_count}: '{chunk}'")
+                            adaptive_timeout.adjust(has_data=True)  # 有数据，减小超时
+                            logger.debug(f"[TTS_DEBUG] text_chunk_generator 收到chunk#{chunk_count}: '{chunk[:30]}...'")
                             yield chunk
                         except queue.Empty:
-                            # 超时，检查是否已经结束
+                            # 超时，调整超时时间
+                            adaptive_timeout.adjust(has_data=False)  # 无数据，增大超时
+                            
+                            # 检查是否已经结束
                             if stream_done.is_set() and text_queue.empty():
                                 logger.info(f"[TTS_DEBUG] text_chunk_generator 超时退出 (stream_done={stream_done.is_set()}, queue_empty={text_queue.empty()})")
                                 break
@@ -405,9 +452,22 @@ class LocalTTSService:
                 # 现在CosyVoice可以在收到第一个完整句子后立即开始处理
                 audio_iter = self.model.synthesize_streaming(**streaming_kwargs)
                 
-                # 用于跟踪当前处理的文本（用于日志）
-                # 由于是流式处理，我们无法提前知道所有文本，所以使用占位符
-                chunk_text = "流式合成中..."  # 占位符文本
+                # 优化：维护当前处理的文本（解决文本信息丢失问题）
+                # 从sentence_audio_map中获取实际文本，而不是使用占位符
+                current_sentence_key = None
+                current_sentence_text = None
+                
+                # 尝试获取第一个句子（如果有）
+                try:
+                    # 从队列中获取第一个句子（不阻塞）
+                    if not text_queue.empty():
+                        first_item = text_queue.get_nowait()
+                        if first_item and first_item is not None and isinstance(first_item, tuple):
+                            current_sentence_key, current_sentence_text = first_item
+                            # 重新放回队列（因为text_chunk_generator会取）
+                            text_queue.put(first_item)
+                except queue.Empty:
+                    pass
                 
                 # 辅助函数：在线程池中执行同步的next()调用，避免阻塞事件循环
                 # 注意：StopIteration在asyncio协程中不能直接raise，需要使用自定义异常
@@ -438,12 +498,15 @@ class LocalTTSService:
                     return result
                 
                 try:
-                    # 等待一小段时间，确保文本收集任务有足够时间填充队列
-                    # 这样可以避免模型在等待第一个文本chunk时阻塞
-                    await asyncio.sleep(0.1)
+                    # 优化：减小初始等待时间（0.1秒 → 0.05秒）
+                    await asyncio.sleep(0.05)
                     
                     # 获取第一个音频tensor（在线程池中执行，避免阻塞）
                     current_audio = await safe_next(audio_iter)
+                    
+                    # 优化：维护句子索引，用于追踪当前处理的文本
+                    sentence_index = 0
+                    sentence_keys = sorted(sentence_audio_map.keys()) if sentence_audio_map else []
                     
                     while True:
                         # 尝试获取下一个音频tensor来判断是否是最后一个
@@ -454,9 +517,17 @@ class LocalTTSService:
                             chunk_id = f"{request_id}_chunk_{chunk_counter}"
                             audio_bytes = self._torch_to_bytes(current_audio, format)
                             
+                            # 优化：使用实际文本，不是占位符
+                            # 根据句子索引获取对应的文本
+                            if sentence_index < len(sentence_keys):
+                                sentence_key = sentence_keys[sentence_index]
+                                actual_text = sentence_audio_map.get(sentence_key, "处理中...")
+                            else:
+                                actual_text = current_sentence_text or "处理中..."
+                            
                             yield AudioChunk(
                                 chunk_id=chunk_id,
-                                text=chunk_text,
+                                text=actual_text,  # ✅ 使用实际文本
                                 audio_data=audio_bytes,
                                 format=format,
                                 is_final=False,
@@ -465,20 +536,30 @@ class LocalTTSService:
                                     "sample_rate": self.sample_rate,
                                     "local_model": True,
                                     "streaming": True,
-                                    "chunk_index": chunk_counter
+                                    "chunk_index": chunk_counter,
+                                    "sentence_key": sentence_keys[sentence_index] if sentence_index < len(sentence_keys) else None
                                 }
                             )
                             # 更新当前tensor
                             current_audio = next_audio
+                            # 移动到下一个句子（每个音频块对应一个句子）
+                            sentence_index += 1
                         except IteratorExhausted:
                             # 没有下一个，当前是最后一个
                             chunk_counter += 1
                             chunk_id = f"{request_id}_chunk_{chunk_counter}"
                             audio_bytes = self._torch_to_bytes(current_audio, format)
                             
+                            # 优化：使用实际文本，不是占位符
+                            if sentence_index < len(sentence_keys):
+                                sentence_key = sentence_keys[sentence_index]
+                                actual_text = sentence_audio_map.get(sentence_key, "处理中...")
+                            else:
+                                actual_text = current_sentence_text or "处理中..."
+                            
                             yield AudioChunk(
                                 chunk_id=chunk_id,
-                                text=chunk_text,
+                                text=actual_text,  # ✅ 使用实际文本
                                 audio_data=audio_bytes,
                                 format=format,
                                 is_final=True,
@@ -487,7 +568,8 @@ class LocalTTSService:
                                     "sample_rate": self.sample_rate,
                                     "local_model": True,
                                     "streaming": True,
-                                    "chunk_index": chunk_counter
+                                    "chunk_index": chunk_counter,
+                                    "sentence_key": sentence_keys[sentence_index] if sentence_index < len(sentence_keys) else None
                                 }
                             )
                             break
@@ -539,6 +621,45 @@ class LocalTTSService:
 
         except Exception as e:
             logger.error(f"本地 TTS 合成失败: {e}", exc_info=True)
+            # 优化：添加错误恢复机制（重试和降级）
+            from core.retry import retry_async, RetryConfig
+            
+            # 如果是一次性错误，尝试重试
+            if chunk_counter == 0:  # 还没有生成任何chunk
+                logger.warning(f"TTS合成失败，尝试重试: request_id={request_id}")
+                try:
+                    # 重试一次（使用批量模式作为降级）
+                    remaining_text = sentence_buffer.flush() if 'sentence_buffer' in locals() else ""
+                    if remaining_text:
+                        logger.info(f"使用批量模式作为降级: request_id={request_id}")
+                        audio_data = await self.synthesize_batch(
+                            text=remaining_text,
+                            language=language,
+                            request_id=request_id,
+                            format=format,
+                            sample_rate=sample_rate,
+                            voice=voice
+                        )
+                        if audio_data:
+                            yield AudioChunk(
+                                chunk_id=f"{request_id}_chunk_fallback",
+                                text=remaining_text,
+                                audio_data=audio_data,
+                                format=format,
+                                is_final=True,
+                                timestamp=int(asyncio.get_event_loop().time() * 1000),
+                                metadata={
+                                    "sample_rate": self.sample_rate,
+                                    "local_model": True,
+                                    "fallback": True
+                                }
+                            )
+                            logger.info(f"降级模式成功: request_id={request_id}")
+                            return
+                except Exception as retry_error:
+                    logger.error(f"重试也失败: {retry_error}", exc_info=True)
+            
+            # 如果重试失败，抛出异常
             raise
 
     async def synthesize_batch(

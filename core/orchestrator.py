@@ -10,19 +10,15 @@
 """
 import time
 import asyncio
-import base64
 import logging
 from typing import AsyncGenerator, Dict, Any, List, Optional
 
 from core.graph.workflow import build_news_workflow, build_preprocessing_workflow
 from models.state import NewsAgentState
 from prompts import build_news_summary_messages
-from models.api import BaseResponse, ResponseData, FramePart, FramePartAudio, FramePartImage
-from core.utils import (
-    extract_debug_info_from_system_agent,
-    merge_debug_info,
-    build_debug_info_from_state
-)
+from core.utils import build_debug_info_from_state
+from core.response_builder import ResponseBuilder
+from core.tts_stream_processor import TTSStreamProcessor
 from llm_utils.config import config
 
 logger = logging.getLogger(__name__)
@@ -172,11 +168,11 @@ class NewsAgentOrchestrator:
             else:
                 # 非流式模式：使用完整工作流
                 final_state = await self.workflow.ainvoke(initial_state)
-                yield self._build_final_response(final_state, request_id, request_start_time)
+                yield ResponseBuilder.build_final_response(final_state, request_id, request_start_time)
 
         except Exception as e:
             logger.error(f"处理查询失败: {e}", exc_info=True)
-            yield self._build_error_response(str(e), request_id)
+            yield ResponseBuilder.build_error_response(str(e), request_id)
 
     async def _process_stream(
         self,
@@ -217,7 +213,7 @@ class NewsAgentOrchestrator:
             if preprocessing_state.get("error"):
                 error = preprocessing_state["error"]
                 logger.error(f"前置处理错误: {error}")
-                yield self._build_error_response(error, request_id)
+                yield ResponseBuilder.build_error_response(error, request_id)
                 return
             
             # 获取选中的新闻
@@ -228,7 +224,7 @@ class NewsAgentOrchestrator:
             logger.info(f"前置处理完成: selected_news={len(selected_news)}, tts_language={tts_language}, image_links={len(image_links)}")
             
             if not selected_news:
-                yield self._build_error_response("未找到相关新闻", request_id)
+                yield ResponseBuilder.build_error_response("未找到相关新闻", request_id)
                 return
             
             # ==================== 优化：提前并行准备LLM和TTS资源 ====================
@@ -264,7 +260,7 @@ class NewsAgentOrchestrator:
             # 立即发送图片帧（不等待准备任务完成）
             if image_links:
                 frame_id += 1
-                yield self._build_image_frame(
+                yield ResponseBuilder.build_image_frame(
                     frame_id=frame_id,
                     image_links=image_links,
                     request_id=request_id
@@ -275,7 +271,7 @@ class NewsAgentOrchestrator:
             llm_prep_result = await llm_prep_task
             
             if llm_prep_result is None:
-                yield self._build_error_response("准备LLM资源失败", request_id)
+                yield ResponseBuilder.build_error_response("准备LLM资源失败", request_id)
                 return
             
             thinking_config = llm_prep_result["thinking_config"]
@@ -287,7 +283,7 @@ class NewsAgentOrchestrator:
                 
         except Exception as e:
             logger.error(f"前置处理失败: {e}", exc_info=True)
-            yield self._build_error_response(f"前置处理失败: {str(e)}", request_id)
+            yield ResponseBuilder.build_error_response(f"前置处理失败: {str(e)}", request_id)
             return
         
         # ==================== 第二阶段：流式生成（手动处理） ====================
@@ -306,95 +302,73 @@ class NewsAgentOrchestrator:
         final_image_links = image_links
         
         # 流式TTS集成：创建文本流生成器和队列
-        # 增加队列大小，并添加文本缓冲机制来协调速度
+        # 优化：添加背压控制，防止队列堆积
+        from tts_utils.tts_optimization_utils import BackpressureController
+        
         text_stream_queue: asyncio.Queue = asyncio.Queue(maxsize=200)  # 增大队列容量
         audio_queue: asyncio.Queue = asyncio.Queue(maxsize=50)  # 音频队列
         text_stream_done = False  # 标记文本流是否结束
         audio_stream_done = False  # 标记音频流是否结束
         
+        # 优化：创建背压控制器
+        text_backpressure = BackpressureController(text_stream_queue, threshold=0.8)
+        audio_backpressure = BackpressureController(audio_queue, threshold=0.8)
+        
         # TTS服务已在准备阶段初始化（优化：提前初始化）
         logger.info(f"TTS服务: service={tts_service}, enabled={getattr(tts_service, 'enabled', 'unknown') if tts_service else 'None'}, mock_mode={getattr(tts_service, 'mock_mode', 'unknown') if tts_service else 'None'}")
         
         async def text_stream_generator():
-            """将队列中的文本token转换为流式生成器，带智能缓冲机制（优化：减少等待时间）"""
-            buffer = ""  # 文本缓冲区，累积一定长度后再yield
-            buffer_size = 5  # 缓冲区大小（字符数），减小以加快TTS启动
-            buffer_timeout = 0.01  # 缓冲区超时（秒），优化：从0.05秒减少到0.01秒，更快响应
-            first_token = True  # 标记是否是第一个token
-            last_token_time = None  # 最后一个token的时间
+            """
+            将队列中的文本token转换为流式生成器
+            
+            优化：
+            1. 消除双重缓冲 - 直接传递token
+            2. 动态超时调整 - 根据数据流自适应调整超时
+            """
+            from tts_utils.tts_optimization_utils import AdaptiveTimeout
+            
+            # 优化：使用自适应超时
+            adaptive_timeout = AdaptiveTimeout(
+                initial=0.1,
+                min_timeout=0.001,
+                max_timeout=0.3
+            )
             
             while True:
                 try:
                     # 检查是否已完成且队列为空
                     if text_stream_done and text_stream_queue.empty():
-                        # 输出剩余的缓冲区内容
-                        if buffer:
-                            yield buffer
-                            buffer = ""
                         break
                     
                     try:
-                        # 使用wait_for避免无限等待，有数据立即返回
-                        # 优化：timeout从0.05秒减少到0.01秒，减少80%的等待延迟
+                        # 优化：使用自适应超时
+                        timeout = adaptive_timeout.get_timeout()
                         token = await asyncio.wait_for(
                             text_stream_queue.get(),
-                            timeout=buffer_timeout
+                            timeout=timeout
                         )
                         
                         if token is None:  # 结束信号
-                            # 输出剩余的缓冲区内容
-                            if buffer:
-                                yield buffer
-                                buffer = ""
                             break
                         
-                        current_time = time.time()
-                        
-                        # 第一个token立即yield，不等待缓冲区填满，让TTS尽快启动
-                        if first_token:
-                            if buffer:
-                                # 如果缓冲区已有内容，先yield缓冲区+token
-                                yield buffer + token
-                            else:
-                                # 直接yield第一个token，立即启动TTS
-                                yield token
-                            buffer = ""
-                            first_token = False
-                            last_token_time = current_time
-                            logger.debug(f"✅ 第一个文本token已yield给TTS: {token[:20]}...")
-                            continue
-                        
-                        # 累积到缓冲区
-                        buffer += token
-                        last_token_time = current_time
-                        
-                        # 当缓冲区达到一定大小时，立即yield出去
-                        if len(buffer) >= buffer_size:
-                            yield buffer
-                            buffer = ""
+                        # 直接yield token，不缓冲（优化：消除双重缓冲）
+                        # TTS的SentenceBuffer会负责分句和缓冲
+                        adaptive_timeout.adjust(has_data=True)  # 有数据，减小超时
+                        yield token
+                        logger.debug(f"✅ Token已yield给TTS: {token[:20]}...")
                             
                     except asyncio.TimeoutError:
-                        # 超时（buffer_timeout秒内没有新数据），检查是否有缓冲内容需要输出
-                        current_time = time.time()
-                        
-                        # 优化：如果有缓冲区内容，立即yield，不等待超时时间累积
-                        if buffer:
-                            yield buffer
-                            buffer = ""
-                            last_token_time = None
+                        # 超时，调整超时时间
+                        adaptive_timeout.adjust(has_data=False)  # 无数据，增大超时
                         
                         # 检查是否已完成
                         if text_stream_done and text_stream_queue.empty():
                             break
-                        # 继续循环，等待下一个token（timeout已优化为0.005秒）
+                        # 继续循环，等待下一个token
                         continue
                         
                 except Exception as e:
                     logger.error(f"文本流生成器错误: {e}", exc_info=True)
-                    # 输出剩余的缓冲区内容
-                    if buffer:
-                        yield buffer
-                        buffer = ""
                     break
         
         # 启动流式TTS合成任务
@@ -404,12 +378,15 @@ class NewsAgentOrchestrator:
             if tts_service is None:
                 logger.warning("TTS服务未初始化，跳过音频合成")
             else:
+                # 使用TTSStreamProcessor处理流式TTS
+                tts_processor = TTSStreamProcessor(
+                    tts_service=tts_service,
+                    language=tts_language,
+                    request_id=request_id
+                )
                 tts_task = asyncio.create_task(
-                    self._process_tts_stream(
+                    tts_processor.process_tts_stream(
                         text_stream_generator(),
-                        tts_service,
-                        tts_language,
-                        request_id,
                         audio_queue
                     )
                 )
@@ -466,7 +443,7 @@ class NewsAgentOrchestrator:
                     audio_chunk_data = pending_audio_chunks.pop(0)
                     frame_id += 1
                     streaming_audio_chunks_tracker.append(audio_chunk_data)  # 记录音频块
-                    yield self._build_audio_token_frame(
+                    yield ResponseBuilder.build_audio_token_frame(
                         frame_id=frame_id,
                         audio_chunk=audio_chunk_data,
                         is_final=False,
@@ -481,7 +458,7 @@ class NewsAgentOrchestrator:
                     # Thinking token → 立即 yield thinking 帧（独立返回）
                     thinking_content += token_content
                     frame_id += 1
-                    yield self._build_thinking_token_frame(
+                    yield ResponseBuilder.build_thinking_token_frame(
                         frame_id=frame_id,
                         thinking_token=token_content,
                         request_id=request_id
@@ -498,29 +475,19 @@ class NewsAgentOrchestrator:
                     
                     # Content token → 立即 yield 文本帧（独立返回）
                     frame_id += 1
-                    yield self._build_text_token_frame(
+                    yield ResponseBuilder.build_text_token_frame(
                         frame_id=frame_id,
                         text_token=token_content,
                         request_id=request_id
                     )
                     
-                    # 将文本token发送到TTS流（非阻塞，带重试机制）
-                    retry_count = 0
-                    max_retries = 3
-                    while retry_count < max_retries:
-                        try:
-                            text_stream_queue.put_nowait(token_content)
-                            break  # 成功放入队列
-                        except asyncio.QueueFull:
-                            retry_count += 1
-                            if retry_count < max_retries:
-                                # 优化：减少等待时间，从10ms减少到5ms
-                                await asyncio.sleep(0.005)
-                            else:
-                                logger.warning(f"TTS文本流队列已满，跳过token: {token_content[:20]}...")
-                        except Exception as e:
-                            logger.error(f"发送文本到TTS流失败: {e}")
-                            break
+                    # 优化：使用背压控制器发送文本token（自动处理队列满的情况）
+                    try:
+                        await text_backpressure.put(token_content)
+                    except Exception as e:
+                        logger.error(f"发送文本到TTS流失败: {e}")
+                        # 如果背压控制失败，记录警告但继续处理
+                        logger.warning(f"TTS文本流队列背压控制失败，跳过token: {token_content[:20]}...")
                     
                     # 优化：统一音频处理逻辑，避免重复代码
                     # 在yield文本后，立即检查并处理所有待处理的音频块
@@ -529,7 +496,7 @@ class NewsAgentOrchestrator:
                             audio_chunk_data = pending_audio_chunks.pop(0)
                             frame_id += 1
                             streaming_audio_chunks_tracker.append(audio_chunk_data)  # 记录音频块
-                            yield self._build_audio_token_frame(
+                            yield ResponseBuilder.build_audio_token_frame(
                                 frame_id=frame_id,
                                 audio_chunk=audio_chunk_data,
                                 is_final=False,
@@ -596,7 +563,7 @@ class NewsAgentOrchestrator:
                 frame_id += 1
                 remaining_audio_count += 1
                 streaming_audio_chunks_tracker.append(audio_chunk_data)  # 记录音频块
-                yield self._build_audio_token_frame(
+                yield ResponseBuilder.build_audio_token_frame(
                     frame_id=frame_id,
                     audio_chunk=audio_chunk_data,
                     is_final=False,
@@ -610,7 +577,7 @@ class NewsAgentOrchestrator:
                     frame_id += 1
                     remaining_audio_count += 1
                     streaming_audio_chunks_tracker.append(audio_chunk_data)  # 记录音频块
-                    yield self._build_audio_token_frame(
+                    yield ResponseBuilder.build_audio_token_frame(
                         frame_id=frame_id,
                         audio_chunk=audio_chunk_data,
                         is_final=False,
@@ -649,7 +616,7 @@ class NewsAgentOrchestrator:
             
             # 发送最终帧（包含图片链接和debug_info）
             frame_id += 1
-            yield self._build_final_stream_frame(
+            yield ResponseBuilder.build_final_stream_frame(
                 frame_id=frame_id,
                 full_text=content_buffer,
                 thinking_content=thinking_content,
@@ -669,494 +636,13 @@ class NewsAgentOrchestrator:
                     audio_monitor_task_handle.cancel()
                 except:
                     pass
-            yield self._build_error_response(f"流式生成失败: {str(e)}", request_id)
+            yield ResponseBuilder.build_error_response(f"流式生成失败: {str(e)}", request_id)
 
-    async def _process_tts_stream(
-        self,
-        text_stream: AsyncGenerator[str, None],
-        tts_service,
-        language: str,
-        request_id: str,
-        audio_queue: asyncio.Queue
-    ):
-        """
-        处理流式TTS合成
-        
-        Args:
-            text_stream: 文本流生成器
-            tts_service: TTS服务实例
-            language: TTS语言
-            request_id: 请求ID
-            audio_queue: 音频队列
-        """
-        audio_chunk_count = 0
-        try:
-            logger.info(f"开始处理流式TTS: request_id={request_id}, language={language}")
-            async for audio_chunk in tts_service.synthesize_stream(
-                text_stream=text_stream,
-                language=language,
-                request_id=request_id
-            ):
-                # 将音频块转换为base64并放入队列
-                audio_base64 = base64.b64encode(audio_chunk.audio_data).decode("utf-8")
-                await audio_queue.put(audio_base64)
-                audio_chunk_count += 1
-                logger.info(
-                    f"✅ TTS音频块生成 #{audio_chunk_count}: chunk_id={audio_chunk.chunk_id}, "
-                    f"text_len={len(audio_chunk.text)}, audio_len={len(audio_chunk.audio_data)} bytes, "
-                    f"is_final={audio_chunk.is_final}"
-                )
-            logger.info(f"流式TTS处理完成: request_id={request_id}, 共生成 {audio_chunk_count} 个音频块")
-        except Exception as e:
-            logger.error(f"❌ 流式TTS处理失败: request_id={request_id}, error={e}", exc_info=True)
-    
-    async def _generate_tts_chunk(
-        self,
-        text: str,
-        language: str,
-        audio_queue: asyncio.Queue
-    ):
-        """
-        异步生成 TTS 音频块（批量模式，兼容旧代码）
-        
-        Args:
-            text: 要合成的文本
-            language: TTS 语言
-            audio_queue: 音频队列
-        """
-        try:
-            from tts_utils import get_tts_service
-            
-            tts_service = get_tts_service()
-            
-            # 使用批量模式合成
-            audio_data = await tts_service.synthesize_batch(
-                text=text,
-                language=language,
-                request_id=f"chunk_{id(text)}"
-            )
-            
-            # 转换为base64
-            audio_base64 = base64.b64encode(audio_data).decode("utf-8")
-            
-            await audio_queue.put(audio_base64)
-            logger.debug(f"TTS 块生成完成: text_len={len(text)}, language={language}")
-            
-        except Exception as e:
-            logger.error(f"TTS 生成失败: {e}", exc_info=True)
-
-    def _build_thinking_token_frame(
-        self, 
-        frame_id: int, 
-        thinking_token: str, 
-        request_id: str
-    ) -> str:
-        """构建 thinking token 流式帧"""
-        response_data = ResponseData(
-            frame_id=frame_id,
-            frame_timestamp=int(time.time() * 1000),
-            frame_text=thinking_token,  # 增量文本放在 frame_text 中
-            frame_is_final=False,
-            response_type="thinking",
-            extension={
-                "token_type": "thinking"
-            }
-        )
-        
-        response = BaseResponse(
-            version="2.1",
-            request_id=request_id,
-            code=0,
-            message="success",
-            data=response_data
-        )
-        
-        return f"event:data\ndata:{response.model_dump_json(exclude_none=False)}\n\n"
-
-    def _build_text_token_frame(
-        self, 
-        frame_id: int, 
-        text_token: str, 
-        request_id: str
-    ) -> str:
-        """构建 text token 流式帧"""
-        response_data = ResponseData(
-            frame_id=frame_id,
-            frame_timestamp=int(time.time() * 1000),
-            frame_text=text_token,  # 增量文本放在 frame_text 中
-            frame_is_final=False,
-            response_type="text",
-            extension={
-                "token_type": "content"
-            }
-        )
-        
-        response = BaseResponse(
-            version="2.1",
-            request_id=request_id,
-            code=0,
-            message="success",
-            data=response_data
-        )
-        
-        return f"event:data\ndata:{response.model_dump_json(exclude_none=False)}\n\n"
-
-    def _build_audio_token_frame(
-        self, 
-        frame_id: int, 
-        audio_chunk: str, 
-        is_final: bool,
-        request_id: str
-    ) -> str:
-        """构建 audio 流式帧"""
-        frame_parts = [
-            FramePart(
-                type="audio",
-                audio=FramePartAudio(
-                    format="pcm",
-                    data=f"data:;base64,{audio_chunk}",
-                    is_final=is_final
-                )
-            )
-        ]
-        
-        response_data = ResponseData(
-            frame_id=frame_id,
-            frame_timestamp=int(time.time() * 1000),
-            frame_text="",
-            frame_is_final=False,
-            response_type="audio",
-            frame_parts=frame_parts,
-            extension={
-                "token_type": "audio"
-            }
-        )
-        
-        response = BaseResponse(
-            version="2.1",
-            request_id=request_id,
-            code=0,
-            message="success",
-            data=response_data
-        )
-        
-        return f"event:data\ndata:{response.model_dump_json(exclude_none=False)}\n\n"
-
-    def _build_image_frame(
-        self,
-        frame_id: int,
-        image_links: List[str],
-        request_id: str
-    ) -> str:
-        """构建包含图片链接的初始帧"""
-        frame_parts = []
-        
-        # 为每个图片链接创建 FramePart
-        for img_url in image_links[:10]:  # 最多10张图片
-            # 从URL推断图片格式
-            img_format = "jpg"  # 默认格式
-            if img_url:
-                if img_url.endswith((".png", ".PNG")):
-                    img_format = "png"
-                elif img_url.endswith((".jpg", ".jpeg", ".JPG", ".JPEG")):
-                    img_format = "jpg"
-                elif img_url.endswith((".gif", ".GIF")):
-                    img_format = "gif"
-                elif img_url.endswith((".webp", ".WEBP")):
-                    img_format = "webp"
-            
-            frame_parts.append(
-                FramePart(
-                    type="image",
-                    image=FramePartImage(
-                        format=img_format,
-                        data=img_url
-                    )
-                )
-            )
-        
-        response_data = ResponseData(
-            frame_id=frame_id,
-            frame_timestamp=int(time.time() * 1000),
-            frame_text="",
-            frame_is_final=False,
-            response_type="image",
-            frame_parts=frame_parts if frame_parts else None,
-            extension={
-                "image_count": len(image_links),
-                "total_images": len(image_links)
-            }
-        )
-        
-        response = BaseResponse(
-            version="2.1",
-            request_id=request_id,
-            code=0,
-            message="success",
-            data=response_data
-        )
-        
-        return f"event:data\ndata:{response.model_dump_json(exclude_none=False)}\n\n"
-
-    def _build_final_stream_frame(
-        self,
-        frame_id: int,
-        full_text: str,
-        thinking_content: str,
-        image_links: List[str],
-        request_id: str,
-        debug_info: Optional[Dict[str, Any]] = None,
-        system_agent_response: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """
-        构建流式生成的最终帧
-        
-        Args:
-            frame_id: 帧ID
-            full_text: 完整文本内容
-            thinking_content: 思考内容
-            image_links: 图片链接列表
-            request_id: 请求ID
-            debug_info: 从状态中提取的debug信息（优先使用）
-            system_agent_response: systemAgent响应（可选，用于合并外部debug信息）
-        """
-        # 优先使用传入的debug_info，如果没有则尝试从systemAgent响应中提取
-        final_debug_info = debug_info
-        if not final_debug_info and system_agent_response:
-            final_debug_info = extract_debug_info_from_system_agent(system_agent_response)
-        elif final_debug_info and system_agent_response:
-            # 如果两者都有，合并它们
-            system_debug_info = extract_debug_info_from_system_agent(system_agent_response)
-            final_debug_info = merge_debug_info(final_debug_info, system_debug_info)
-        
-        # 最后一帧不需要传递图片或语音，仅提供 complete_content
-        response_data = ResponseData(
-            frame_id=frame_id,
-            frame_timestamp=int(time.time() * 1000),
-            frame_text="",  # 最终帧不填充 frame_text
-            frame_is_final=True,
-            complete_content=full_text,  # 仅提供完整内容
-            frame_parts=None,  # 不包含图片或音频
-            extension={
-                "thinking_content": thinking_content,
-                "total_text_length": len(full_text),
-                "total_thinking_length": len(thinking_content),
-                "image_count": len(image_links)
-            },
-            debug_info=final_debug_info
-        )
-        
-        response = BaseResponse(
-            version="2.1",
-            request_id=request_id,
-            code=0,
-            message="success",
-            data=response_data
-        )
-        
-        return f"event:data\ndata:{response.model_dump_json(exclude_none=False)}\n\n"
-
-    def _build_text_frame(self, frame_id: int, text: str, is_final: bool, request_id: str) -> str:
-        """构建文本流式响应帧（兼容旧版）"""
-        response_data = ResponseData(
-            frame_id=frame_id,
-            frame_timestamp=int(time.time() * 1000),
-            frame_text=text,
-            frame_is_final=is_final
-        )
-        
-        response = BaseResponse(
-            version="2.1",
-            request_id=request_id,
-            code=0,
-            message="success",
-            data=response_data
-        )
-        
-        return f"event:data\ndata:{response.model_dump_json(exclude_none=False)}\n\n"
-
-    def _build_audio_frame(self, frame_id: int, audio_chunk: str, is_final: bool, request_id: str) -> str:
-        """构建音频流式响应帧（兼容旧版）"""
-        frame_parts = [
-            FramePart(
-                type="audio",
-                audio=FramePartAudio(
-                    format="pcm",
-                    data=f"data:;base64,{audio_chunk}",
-                    is_final=is_final
-                )
-            )
-        ]
-        
-        response_data = ResponseData(
-            frame_id=frame_id,
-            frame_timestamp=int(time.time() * 1000),
-            frame_text="",
-            frame_is_final=is_final,
-            frame_parts=frame_parts
-        )
-        
-        response = BaseResponse(
-            version="2.1",
-            request_id=request_id,
-            code=0,
-            message="success",
-            data=response_data
-        )
-        
-        return f"event:data\ndata:{response.model_dump_json(exclude_none=False)}\n\n"
-
-    def _build_thinking_frame(self, frame_id: int, thinking_step: Dict[str, Any], request_id: str) -> str:
-        """构建思维链响应帧（兼容旧版）"""
-        node_name = thinking_step.get("node", "unknown")
-        thinking = thinking_step.get("thinking", "")
-        
-        thinking_text = thinking if thinking else "正在思考..."
-        
-        response_data = ResponseData(
-            frame_id=frame_id,
-            frame_timestamp=thinking_step.get("timestamp", int(time.time() * 1000)),
-            frame_text=thinking_text,
-            frame_is_final=False,
-            response_type="thinking",
-            extension={
-                "thinking_step": thinking_step,
-                "node": node_name,
-                "has_audio": False
-            }
-        )
-        
-        response = BaseResponse(
-            version="2.1",
-            request_id=request_id,
-            code=0,
-            message="success",
-            data=response_data
-        )
-        
-        return f"event:data\ndata:{response.model_dump_json(exclude_none=False)}\n\n"
-
-    def _build_final_response(
-        self,
-        state: NewsAgentState,
-        request_id: str,
-        request_start_time: Optional[float] = None,
-        system_agent_response: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """
-        构建最终响应（非流式模式）
-        
-        Args:
-            state: 状态对象
-            request_id: 请求ID
-            request_start_time: 请求开始时间（可选，用于计算总耗时）
-            system_agent_response: 可选的systemAgent响应消息，用于提取debug_info
-        """
-        summary = state.get("summary", "")
-        image_links = state.get("image_links", [])
-        audio_data = state.get("audio_data")
-        thinking_chain = state.get("thinking_chain", [])
-        
-        # 从状态中提取debug_info
-        debug_info = build_debug_info_from_state(state, request_start_time)
-        
-        # 如果提供了systemAgent响应，合并debug信息
-        if system_agent_response:
-            system_debug_info = extract_debug_info_from_system_agent(system_agent_response)
-            debug_info = merge_debug_info(debug_info, system_debug_info)
-
-        # 构建响应数据
-        response_data = ResponseData(
-            frame_id=0,
-            frame_timestamp=int(time.time() * 1000),
-            frame_text="",
-            frame_is_final=True,
-            complete_content=summary,
-            extension={
-                "news_count": state.get("news_count", 0),
-                "processing_steps": state.get("processing_steps", []),
-                "image_count": len(image_links),
-                "tts_language": state.get("tts_language", "zh"),
-                "thinking_chain": thinking_chain
-            },
-            debug_info=debug_info
-        )
-
-        # 添加音频和图片（如果有）
-        frame_parts = []
-        if audio_data:
-            frame_parts.append(
-                FramePart(
-                    type="audio",
-                    audio=FramePartAudio(
-                        format="pcm",
-                        data=f"data:;base64,{audio_data}",
-                        is_final=True
-                    )
-                )
-            )
-        
-        # 添加图片链接
-        for img_url in image_links[:10]:  # 最多10张图片
-            img_format = "jpg"  # 默认格式
-            if img_url:
-                if img_url.endswith((".png", ".PNG")):
-                    img_format = "png"
-                elif img_url.endswith((".jpg", ".jpeg", ".JPG", ".JPEG")):
-                    img_format = "jpg"
-                elif img_url.endswith((".gif", ".GIF")):
-                    img_format = "gif"
-                elif img_url.endswith((".webp", ".WEBP")):
-                    img_format = "webp"
-            
-            frame_parts.append(
-                FramePart(
-                    type="image",
-                    image=FramePartImage(
-                        format=img_format,
-                        data=img_url
-                    )
-                )
-            )
-
-        if frame_parts:
-            response_data.frame_parts = frame_parts
-
-        # 构建完整响应
-        response = BaseResponse(
-            version="2.1",
-            request_id=request_id,
-            code=0,
-            message="success",
-            data=response_data
-        )
-
-        return f"event:data\ndata:{response.model_dump_json(exclude_none=False)}\n\n"
-
-    def _build_error_response(
-        self,
-        error_message: str,
-        request_id: str
-    ) -> str:
-        """
-        构建错误响应
-        """
-        response_data = ResponseData(
-            frame_id=0,
-            frame_timestamp=int(time.time() * 1000),
-            frame_text="",
-            frame_is_final=True
-        )
-
-        response = BaseResponse(
-            version="2.1",
-            request_id=request_id,
-            code=500,
-            message=error_message,
-            data=response_data
-        )
-
-        return f"event:data\ndata:{response.model_dump_json(exclude_none=False)}\n\n"
+    # 注意：以下方法已迁移到 ResponseBuilder 和 TTSStreamProcessor
+    # 保留这些注释以便将来参考
+    # - _process_tts_stream -> TTSStreamProcessor.process_tts_stream
+    # - _generate_tts_chunk -> TTSStreamProcessor.generate_tts_chunk
+    # - _build_* 方法 -> ResponseBuilder.build_* 方法
 
 
 # ==================== 测试代码 ====================

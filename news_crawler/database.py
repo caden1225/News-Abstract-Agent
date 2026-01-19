@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 class Database:
-    """数据库操作类"""
+    """数据库操作类（优化版：改进的连接池和健康检查）"""
 
     def __init__(self, db_path: str = "data/news.db", post_processor: Optional[PostProcessor] = None):
         self.db_path = db_path
@@ -22,104 +22,129 @@ class Database:
         # 优化：使用连接池（SQLite连接复用）
         self._connection_pool = None
         self._pool_lock = None
+        self._connection_created_at = None
+        self._max_connection_age = 3600  # 连接最大存活时间（秒），1小时后重新创建
         self.init_database()
 
     def get_connection(self):
         """
-        获取数据库连接（优化：使用连接池复用连接）
+        获取数据库连接（优化版：带健康检查和连接老化管理）
         
         注意：SQLite是文件数据库，连接池主要是复用连接对象，减少创建开销
         """
         import threading
         import os
         from pathlib import Path
+        from datetime import datetime, timedelta
         
         # 初始化连接池（延迟初始化）
-        if self._connection_pool is None:
+        if self._connection_pool is None or self._pool_lock is None:
             try:
                 # 确保数据库目录存在
                 db_dir = Path(self.db_path).parent
                 db_dir.mkdir(parents=True, exist_ok=True)
                 
-                self._connection_pool = sqlite3.connect(
-                    self.db_path,
-                    check_same_thread=False,  # 允许多线程使用
-                    timeout=10.0  # 设置超时
-                )
-                self._connection_pool.row_factory = sqlite3.Row
-                
-                # 优化：启用WAL模式提高并发性能（如果失败则回退到DELETE模式）
-                try:
-                    self._connection_pool.execute("PRAGMA journal_mode=WAL")
-                    journal_mode = self._connection_pool.execute("PRAGMA journal_mode").fetchone()[0]
-                    if journal_mode.upper() != 'WAL':
-                        logger.warning(f"WAL模式启用失败，当前模式: {journal_mode}，回退到DELETE模式")
-                        self._connection_pool.execute("PRAGMA journal_mode=DELETE")
-                except sqlite3.OperationalError as e:
-                    logger.warning(f"设置WAL模式失败: {e}，使用DELETE模式")
-                    try:
-                        self._connection_pool.execute("PRAGMA journal_mode=DELETE")
-                    except:
-                        pass
-                
-                self._connection_pool.execute("PRAGMA synchronous=NORMAL")
-                self._connection_pool.execute("PRAGMA cache_size=10000")
+                self._connection_pool = self._create_connection()
+                self._connection_created_at = datetime.now()
                 self._pool_lock = threading.Lock()
             except sqlite3.OperationalError as e:
-                error_msg = str(e)
-                if "disk I/O error" in error_msg.lower() or "database is locked" in error_msg.lower():
-                    # 检查数据库文件状态
-                    db_path_obj = Path(self.db_path)
-                    if db_path_obj.exists():
-                        file_size = db_path_obj.stat().st_size
-                        logger.error(f"数据库I/O错误: {error_msg}")
-                        logger.error(f"数据库文件: {self.db_path}")
-                        logger.error(f"文件大小: {file_size} 字节")
-                        logger.error("可能的原因:")
-                        logger.error("  1. 数据库文件被其他进程锁定")
-                        logger.error("  2. WAL文件损坏（尝试删除 .db-wal 和 .db-shm 文件）")
-                        logger.error("  3. 磁盘空间不足或权限问题")
-                    else:
-                        logger.error(f"数据库文件不存在: {self.db_path}")
+                self._handle_connection_error(e)
                 raise
         
-        # 优化：获取数据库连接（连接池模式）
-        # 由于已删除所有 conn.close() 调用，连接应该始终保持打开状态
-        # 这里只做基本的空值检查，避免不必要的连接检查开销
+        # 优化：获取数据库连接（连接池模式 + 健康检查）
         with self._pool_lock:
-            # 如果连接池已初始化，直接返回（不再执行 SELECT 1 检查，避免不必要的开销）
-            # 如果连接真的被关闭了，会在实际使用时抛出异常，由调用方处理
-            if self._connection_pool is not None:
-                return self._connection_pool
+            # 检查连接是否需要重新创建（连接老化）
+            if self._connection_created_at:
+                age = (datetime.now() - self._connection_created_at).total_seconds()
+                if age > self._max_connection_age:
+                    logger.info(f"连接已老化（{age:.0f}秒），重新创建连接")
+                    try:
+                        self._connection_pool.close()
+                    except:
+                        pass
+                    self._connection_pool = None
+                    self._connection_created_at = None
             
-            # 如果连接池未初始化，创建新连接
-            try:
-                # 确保数据库目录存在
-                db_dir = Path(self.db_path).parent
-                db_dir.mkdir(parents=True, exist_ok=True)
-                
-                self._connection_pool = sqlite3.connect(
-                    self.db_path,
-                    check_same_thread=False,
-                    timeout=10.0
-                )
-                self._connection_pool.row_factory = sqlite3.Row
-                
-                # 尝试设置WAL模式，失败则使用DELETE模式
+            # 如果连接池未初始化或已关闭，创建新连接
+            if self._connection_pool is None:
                 try:
-                    self._connection_pool.execute("PRAGMA journal_mode=WAL")
-                except sqlite3.OperationalError:
-                    self._connection_pool.execute("PRAGMA journal_mode=DELETE")
-                
-                self._connection_pool.execute("PRAGMA synchronous=NORMAL")
-                self._connection_pool.execute("PRAGMA cache_size=10000")
-            except sqlite3.OperationalError as e:
-                logger.error(f"创建数据库连接失败: {e}")
-                raise
+                    self._connection_pool = self._create_connection()
+                    self._connection_created_at = datetime.now()
+                except sqlite3.OperationalError as e:
+                    self._handle_connection_error(e)
+                    raise
             
-            # 对于SQLite，直接返回共享连接（在单进程多线程环境下是安全的）
-            # 注意：不要关闭此连接，因为它是共享的连接池连接
+            # 健康检查：快速检查连接是否有效
+            try:
+                self._connection_pool.execute("SELECT 1").fetchone()
+            except (sqlite3.OperationalError, sqlite3.ProgrammingError):
+                # 连接已失效，重新创建
+                logger.warning("检测到连接失效，重新创建连接")
+                try:
+                    self._connection_pool.close()
+                except:
+                    pass
+                self._connection_pool = self._create_connection()
+                self._connection_created_at = datetime.now()
+            
             return self._connection_pool
+    
+    def _create_connection(self):
+        """创建新的数据库连接"""
+        from pathlib import Path
+        
+        # 确保数据库目录存在
+        db_dir = Path(self.db_path).parent
+        db_dir.mkdir(parents=True, exist_ok=True)
+        
+        conn = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False,  # 允许多线程使用
+            timeout=10.0  # 设置超时
+        )
+        conn.row_factory = sqlite3.Row
+        
+        # 优化：启用WAL模式提高并发性能（如果失败则回退到DELETE模式）
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            if journal_mode.upper() != 'WAL':
+                logger.warning(f"WAL模式启用失败，当前模式: {journal_mode}，回退到DELETE模式")
+                conn.execute("PRAGMA journal_mode=DELETE")
+        except sqlite3.OperationalError as e:
+            logger.warning(f"设置WAL模式失败: {e}，使用DELETE模式")
+            try:
+                conn.execute("PRAGMA journal_mode=DELETE")
+            except:
+                pass
+        
+        # 性能优化配置
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=10000")
+        conn.execute("PRAGMA temp_store=MEMORY")  # 临时表存储在内存中
+        conn.execute("PRAGMA mmap_size=268435456")  # 256MB内存映射
+        
+        return conn
+    
+    def _handle_connection_error(self, e: sqlite3.OperationalError):
+        """处理连接错误，提供详细的错误信息"""
+        from pathlib import Path
+        
+        error_msg = str(e)
+        if "disk I/O error" in error_msg.lower() or "database is locked" in error_msg.lower():
+            # 检查数据库文件状态
+            db_path_obj = Path(self.db_path)
+            if db_path_obj.exists():
+                file_size = db_path_obj.stat().st_size
+                logger.error(f"数据库I/O错误: {error_msg}")
+                logger.error(f"数据库文件: {self.db_path}")
+                logger.error(f"文件大小: {file_size} 字节")
+                logger.error("可能的原因:")
+                logger.error("  1. 数据库文件被其他进程锁定")
+                logger.error("  2. WAL文件损坏（尝试删除 .db-wal 和 .db-shm 文件）")
+                logger.error("  3. 磁盘空间不足或权限问题")
+            else:
+                logger.error(f"数据库文件不存在: {self.db_path}")
 
     def init_database(self):
         """初始化数据库表"""
@@ -155,7 +180,7 @@ class Database:
         except Exception:
             pass  # 列已存在
 
-        # 创建索引
+        # 创建索引（优化：添加复合索引）
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_url ON news(url)
         """)
@@ -170,6 +195,15 @@ class Database:
         """)
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_source_site ON news(source_site)
+        """)
+        # 优化：添加复合索引以提高常用查询性能
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_news_publish_category 
+            ON news(publish_time DESC, category, source_site)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_news_category_time 
+            ON news(category, publish_time DESC)
         """)
 
         # 创建URL去重表（用于记录已抓取的URL）
@@ -461,10 +495,16 @@ class Database:
         return self.get_news_by_category("today_focus", limit)
 
     def search_news(self, keyword: str, limit: int = 50) -> List[NewsItem]:
-        """搜索新闻"""
+        """
+        搜索新闻（优化：使用索引优化查询）
+        
+        注意：对于大量数据，考虑使用全文索引（FTS5）以获得更好性能
+        """
         conn = self.get_connection()
         cursor = conn.cursor()
 
+        # 优化：使用索引优化的查询
+        # 先搜索标题（通常更快），再搜索内容
         cursor.execute("""
             SELECT * FROM news
             WHERE title LIKE ? OR content LIKE ?

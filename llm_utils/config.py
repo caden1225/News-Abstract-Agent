@@ -1,13 +1,13 @@
 """
 配置管理模块
 支持从 YAML 配置文件读取配置，并支持环境变量替换
-支持可选的Pydantic配置验证
+使用Pydantic进行配置验证和类型安全
 """
 from pathlib import Path
 import yaml
 import os
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
 
 # 加载 .env 文件
 from dotenv import load_dotenv
@@ -20,10 +20,15 @@ project_root = Path(__file__).parent.parent
 
 
 class Config(object):
-    """配置管理类"""
+    """配置管理类（使用Pydantic验证）"""
 
-    def __init__(self):
-        """初始化配置"""
+    def __init__(self, validate: bool = True):
+        """
+        初始化配置
+        
+        Args:
+            validate: 是否使用Pydantic验证配置（默认True）
+        """
         config_path = project_root / 'config' / 'config.yaml'
         logger.info(f"Loading config from: {config_path}")
 
@@ -35,6 +40,17 @@ class Config(object):
 
         # 支持环境变量替换
         self._replace_env_vars()
+        
+        # 使用Pydantic验证配置
+        self._validated_config: Optional[Any] = None
+        if validate:
+            try:
+                from core.config_schema import validate_config
+                self._validated_config = validate_config(self.config_data)
+                logger.info("✅ 配置验证成功")
+            except Exception as e:
+                logger.warning(f"⚠️ 配置验证失败，使用原始配置: {e}")
+                self._validated_config = None
 
         logger.info("Config loaded successfully")
 
@@ -227,11 +243,25 @@ class Config(object):
         try:
             from core.config_schema import validate_config
             validated = validate_config(self.config_data)
+            self._validated_config = validated
             logger.info("配置验证成功")
             return validated.dict()
         except Exception as e:
             logger.error(f"配置验证失败: {e}")
             return None
+    
+    def get_validated(self) -> Optional[Any]:
+        """
+        获取验证后的配置对象（Pydantic模型）
+        
+        Returns:
+            Pydantic配置模型对象，如果未验证则返回None
+        """
+        return self._validated_config
+    
+    def is_validated(self) -> bool:
+        """检查配置是否已通过验证"""
+        return self._validated_config is not None
 
 
 # 全局配置实例
