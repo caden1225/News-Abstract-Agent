@@ -28,14 +28,36 @@ if _wetext_local_path.exists():
 _modelscope_cache_dir = None
 try:
     _modelscope_cache_dir = _project_root / 'data' / 'modelscope_cache'
-    # 使用 exist_ok=True 避免重复创建，如果目录已存在则直接使用
-    _modelscope_cache_dir.mkdir(parents=True, exist_ok=True)
-    os.environ['MODELSCOPE_CACHE'] = str(_modelscope_cache_dir.resolve())
-    os.environ['MODELSCOPE_HUB_CACHE'] = str(_modelscope_cache_dir.resolve())
-except (OSError, PermissionError) as e:
-    # 如果创建目录失败，使用默认缓存目录，避免卡死
-    # 不设置环境变量，让 ModelScope 使用默认缓存目录
-    pass
+
+    # 检查目录是否已存在但权限不正确
+    if _modelscope_cache_dir.exists():
+        # 尝试创建测试文件来检查写权限
+        _test_file = _modelscope_cache_dir / '.write_test'
+        try:
+            _test_file.touch()
+            _test_file.unlink()
+        except (OSError, PermissionError):
+            print(f"⚠️  ModelScope 缓存目录存在但无写权限: {_modelscope_cache_dir}")
+            print("   将使用系统默认缓存目录")
+            _modelscope_cache_dir = None
+    else:
+        # 目录不存在，尝试创建
+        try:
+            _modelscope_cache_dir.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            print(f"⚠️  无法创建 ModelScope 缓存目录: {_modelscope_cache_dir}")
+            print(f"   错误: {e}")
+            print("   将使用系统默认缓存目录")
+            _modelscope_cache_dir = None
+
+    # 只有在目录可用时才设置环境变量
+    if _modelscope_cache_dir is not None:
+        os.environ['MODELSCOPE_CACHE'] = str(_modelscope_cache_dir.resolve())
+        os.environ['MODELSCOPE_HUB_CACHE'] = str(_modelscope_cache_dir.resolve())
+except Exception as e:
+    print(f"⚠️  设置 ModelScope 缓存目录时出错: {e}")
+    print("   将使用系统默认缓存目录")
+    _modelscope_cache_dir = None
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse

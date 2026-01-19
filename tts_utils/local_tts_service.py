@@ -26,6 +26,24 @@ from models.tts import AudioChunk, SentenceBuffer
 logger = logging.getLogger(__name__)
 
 
+def _get_gpu_memory():
+    """获取当前GPU显存使用情况（GB）"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            # 获取当前GPU的属性
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            allocated = torch.cuda.memory_allocated(0) / 1024**3
+            reserved = torch.cuda.memory_reserved(0) / 1024**3
+            free = total - reserved
+
+            return f"总计: {total:.1f}GB | 已用: {allocated:.2f}GB | 可用: {free:.1f}GB"
+        else:
+            return "GPU不可用"
+    except Exception as e:
+        return f"错误: {e}"
+
+
 class LocalTTSService:
     """本地 TTS 服务类（使用 CosyVoice2/CosyVoice3 模型）"""
 
@@ -94,6 +112,15 @@ class LocalTTSService:
                 f"trt_concurrent={trt_concurrent}, vllm={load_vllm}"
             )
 
+            # 清理GPU缓存，确保显存统计准确
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+            # 打印加载前的GPU显存使用
+            logger.info(f"📊 加载TTS模型前显存: {_get_gpu_memory()}")
+
             # 初始化 CosyVoice TTS 服务（启用加速）
             self.model = CosyVoiceTTSService(
                 model_dir=model_dir,
@@ -107,6 +134,12 @@ class LocalTTSService:
             )
             self.enabled = enabled
             self.sample_rate = self.model.sample_rate
+
+            # 同步GPU并打印加载后的显存使用
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            logger.info(f"📊 加载TTS模型后显存: {_get_gpu_memory()}")
+
             logger.info(
                 f"本地 TTS 服务初始化成功: model_dir={model_dir}, spk_id={spk_id}, "
                 f"加速=FP16({fp16})+TensorRT({load_trt})"
