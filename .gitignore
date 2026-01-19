@@ -41,8 +41,6 @@ htmlcov/
 *.db-journal
 *.db-wal
 
-# ModelScope cache (下载的模型缓存)
-data/modelscope_cache/
 
 # Logs
 *.log

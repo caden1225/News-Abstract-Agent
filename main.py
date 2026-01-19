@@ -15,9 +15,13 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 load_dotenv()
 
-# 设置 WETEXT_HOME，使用项目中的本地 Wetext 资源，避免从 ModelScope 下载
-# 在 load_dotenv() 之后设置，确保不会被 .env 文件覆盖
+# 定义项目根目录（必须在设置环境变量之前）
 _project_root = Path(__file__).parent
+
+# ==================== 禁用自动下载（使用本地模型）====================
+# 禁用 Transformers 和 HuggingFace Hub 自动下载
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
+os.environ['HF_HUB_OFFLINE'] = '1'
 _wetext_local_path = _project_root / 'tts_modules' / 'cosyvoice2' / 'Wetext'
 if _wetext_local_path.exists():
     os.environ['WETEXT_HOME'] = str(_wetext_local_path.resolve())
@@ -52,8 +56,19 @@ try:
 
     # 只有在目录可用时才设置环境变量
     if _modelscope_cache_dir is not None:
-        os.environ['MODELSCOPE_CACHE'] = str(_modelscope_cache_dir.resolve())
-        os.environ['MODELSCOPE_HUB_CACHE'] = str(_modelscope_cache_dir.resolve())
+        cache_path = str(_modelscope_cache_dir.resolve())
+        # 设置 ModelScope 相关的所有缓存环境变量
+        os.environ['MODELSCOPE_CACHE'] = cache_path
+        os.environ['MODELSCOPE_HUB_CACHE'] = cache_path
+        # ModelScope 可能使用 hub 目录结构，确保设置正确的路径
+        os.environ['MODELSCOPE_HUB'] = cache_path
+        # 确保 hub 子目录存在
+        hub_dir = _modelscope_cache_dir / 'hub'
+        if not hub_dir.exists():
+            try:
+                hub_dir.mkdir(parents=True, exist_ok=True)
+            except (OSError, PermissionError):
+                pass  # 如果无法创建，继续使用主目录
 except Exception as e:
     print(f"⚠️  设置 ModelScope 缓存目录时出错: {e}")
     print("   将使用系统默认缓存目录")

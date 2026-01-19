@@ -256,7 +256,7 @@ class CosyVoice2Tokenizer():
             ]
         }
         self.special_tokens = special_tokens
-        self.tokenizer = AutoTokenizer.from_pretrained(token_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(token_path, local_files_only=True)
         self.tokenizer.add_special_tokens(special_tokens)
         self.skip_special_tokens = skip_special_tokens
 
@@ -308,7 +308,7 @@ class CosyVoice3Tokenizer(CosyVoice2Tokenizer):
             ]
         }
         self.special_tokens = special_tokens
-        self.tokenizer = AutoTokenizer.from_pretrained(token_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(token_path, local_files_only=True)
         self.tokenizer.add_special_tokens(special_tokens)
         self.skip_special_tokens = skip_special_tokens
 

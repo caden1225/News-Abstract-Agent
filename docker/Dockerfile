@@ -16,7 +16,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # 复制依赖文件
 COPY requirements.txt /tmp/requirements.txt
-
+# COPY /home/caden/c2_module /home/caden/c2_module  # 注释：该目录不在构建上下文中，如需使用请先将其复制到构建上下文或使用相对路径
 # # 安装Python依赖
 # RUN eval "$(micromamba shell hook --shell bash)" && \
 #     micromamba activate /opt/conda && \

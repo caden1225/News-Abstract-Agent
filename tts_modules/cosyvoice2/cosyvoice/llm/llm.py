@@ -229,7 +229,11 @@ class TransformerLM(torch.nn.Module):
 class Qwen2Encoder(torch.nn.Module):
     def __init__(self, pretrain_path):
         super().__init__()
-        self.model = Qwen2ForCausalLM.from_pretrained(pretrain_path)
+        self.model = Qwen2ForCausalLM.from_pretrained(
+            pretrain_path,
+            local_files_only=True,  # 强制只使用本地文件，禁止下载
+            torch_dtype=torch.float16  # 使用 FP16 加载
+        )
 
     def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor):
         T = xs.size(1)
