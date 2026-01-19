@@ -1,0 +1,211 @@
+# news-tts-agent 配置文件
+# 支持 ${VAR_NAME} 格式的环境变量替换
+
+llm:
+  # Sidecar 服务地址（OpenAI 兼容 API）
+  # 注意：此配置仅在 LLM_MODE=sidecar 时使用
+  base_url: http://10.109.253.54:8001/v1
+
+  # API 密钥（从环境变量读取，默认为空）
+  # 设置方式：export LLM_API_KEY=your_key
+  api_key: ${LLM_API_KEY:}
+
+  # 模型配置
+  summarizer_model: Qwen2.5-7B-Instruct
+
+  # 超时配置（秒）
+  timeout: 30
+
+  # 是否启用模型思考功能（thinking）
+  # 仅在摘要生成时生效，意图分析不受此参数影响
+  # 可通过环境变量 ENABLE_LLM_THINKING 覆盖
+  enable_thinking: ${ENABLE_LLM_THINKING:true}
+  
+  # thinking 预算（token数量）
+  thinking_budget: 100
+
+  # 模型生成内容的最大token数限制
+  # 可通过环境变量 LLM_MAX_TOKENS 覆盖
+  # 默认值：意图分析 500，摘要生成 2000
+  max_tokens:
+    # 意图分析的最大token数
+    intent: ${LLM_MAX_TOKENS_INTENT:500}
+    # 摘要生成的最大token数
+    summary: ${LLM_MAX_TOKENS_SUMMARY:2000}
+    # 通用最大token数（如果未指定具体类型，使用此值）
+    default: ${LLM_MAX_TOKENS_DEFAULT:2000}
+
+tts:
+  # 本地 TTS 模型配置
+  # 本地模型目录路径
+  # 可以是绝对路径或相对于项目根目录的路径
+  # 示例: /path/to/CosyVoice2-0.5B 或 modelscope://CosyVoice2-0.5B
+  local_model_dir: ${TTS_LOCAL_MODEL_DIR:null}
+
+  # 本地模型类型
+  # - auto: 自动检测（推荐）
+  # - cosyvoice2: 强制使用 CosyVoice2
+  # - cosyvoice3: 强制使用 CosyVoice3
+  local_model_type: ${TTS_LOCAL_MODEL_TYPE:auto}
+
+  # 默认说话人 ID
+  # 常用值: girl_zh, boy_zh,中性男声,中性女声 等
+  # 可以通过 list_speakers() 方法查看所有可用的说话人
+  default_spk_id: ${TTS_DEFAULT_SPK_ID:ko_girl}
+
+  # 是否启用 TTS 服务
+  enabled: ${TTS_ENABLED:true}
+
+  # TTS 加速配置（方案C: TensorRT加速）
+  acceleration:
+    # 是否启用 FP16 精度推理（2倍速度提升，显存减半）
+    fp16: ${TTS_FP16:true}
+    # 是否启用 TensorRT 加速（flow模型1.5-2倍加速）
+    # 注意：需要安装TensorRT和编译engine，如果环境不支持请设为false
+    tensorrt: ${TTS_TENSORRT:false}
+    # TensorRT 并发数
+    tensorrt_concurrent: ${TTS_TENSORRT_CONCURRENT:4}
+    # 是否启用 vLLM 加速（LLM部分3-5倍加速，需要额外依赖）
+    vllm: ${TTS_VLLM:false}
+    # TensorRT engine 缓存目录
+    tensorrt_cache_dir: ${TTS_TENSORRT_CACHE_DIR:null}
+
+  # Orchestrator 等待策略配置（方案B）
+  orchestrator:
+    # 等待TTS任务完成的超时时间（秒）
+    # 建议值: 30-60秒，取决于文本长度
+    max_wait_for_tts: ${TTS_MAX_WAIT_FOR_TTS:30.0}
+    # 是否启用TTS模型预热（启动时预热，降低首次请求延迟）
+    enable_warmup: ${TTS_ENABLE_WARMUP:true}
+    # 预热超时时间（秒）
+    warmup_timeout: ${TTS_WARMUP_TIMEOUT:15.0}
+
+  # 流式合成性能参数（优化后配置）
+  streaming:
+    # 句子缓冲区配置
+    # min_length: 最小句子长度（字符数），达到此长度且有句子结束标点时才输出
+    # - 快速响应模式: 5-10（适合实时对话）
+    # - 平衡模式: 10-20（适合新闻播报）
+    # - 高效模式: 20-50（适合长文本朗读）
+    min_length: ${TTS_MIN_LENGTH:10}  # 优化: 提高到10，减少短句触发
+
+    # max_length: 最大句子长度（字符数），超过此长度会强制分割
+    # 建议范围: 150-500
+    max_length: ${TTS_MAX_LENGTH:200}
+
+    # max_wait_time: 最大等待时间（秒），超时后强制输出缓冲区内容
+    # - 快速响应: 1.0-2.0 秒
+    # - 平衡模式: 0.5-1.0 秒
+    # - 高效模式: 0.2-0.5 秒
+    max_wait_time: ${TTS_MAX_WAIT_TIME:0.5}  # 优化: 降低到0.5秒，更快响应
+
+    # token_hop_len: 输出音频块大小（token数），影响音频chunk的大小
+    # - 小值(10-20): 更低延迟，更多chunk，适合实时对话（但会导致音频质量下降！）
+    # - 中值(20-30): 平衡延迟和效率
+    # - 大值(50-100): 更高效率，更少chunk，适合长文本（推荐）
+    # ⚠️  重要：token_hop_len过小会导致音频时长异常膨胀和语音质量严重下降
+    token_hop_len: ${TTS_TOKEN_HOP_LEN:50}  # 修复: 增大到50，避免音频膨胀和质量下降
+
+    # mel_cache_len: 边界平滑缓存长度（仅CosyVoice2支持）
+    # 较小的值可以降低延迟，但可能影响音频边界平滑度
+    # 建议范围: 3-10
+    mel_cache_len: ${TTS_MEL_CACHE_LEN:6}
+
+# 新闻源配置
+news:
+  sources:
+    - name: "百度新闻"
+      url: "https://news.baidu.com/ns?word=&tn=news&rtt=1&bsst=1&cl=2&xref=http://www.baidu.com"
+    - name: "新浪新闻"
+      url: "https://news.sina.com.cn/sroll/index.shtml"
+    - name: "网易新闻"
+      url: "http://news.163.com/special/0001386I/ranking_news.xml"
+    - name: "头条RSS"
+      url: "https://www.toutiao.com/rss/news/"
+    - name: "中国新闻网"
+      url: "http://www.chinanews.com/rss/rss_focu.xml"
+
+  # 抓取限制
+  max_news_per_source: 10
+  cache_ttl: 3600  # 缓存1小时
+
+# API 配置
+api:
+  host: 0.0.0.0
+  port: 8080
+  debug: false
+
+# 新闻选择配置
+news_selection:
+  # 选择新闻的数量（用于摘要生成）
+  max_selected_news: 5
+  # 最多提取的图片数量
+  max_images: 10
+
+# 爬虫配置
+crawler:
+  # 配置文件路径（相对于项目根目录）
+  config_path: config/sites.yaml
+  # 数据库路径（相对于项目根目录，默认 data/news.db）
+  db_path: ${CRAWLER_DB_PATH:data/news.db}
+  # 是否显示详细日志
+  verbose: false
+  # 定时爬取间隔（小时）
+  crawl_interval_hours: ${CRAWLER_INTERVAL_HOURS:1}
+  # 定时爬取间隔（分钟）- 用于间隔爬取任务
+  crawl_interval_minutes: ${CRAWLER_INTERVAL_MINUTES:10}
+
+# 定时任务配置
+scheduler:
+  # 是否启用定时任务
+  enabled: ${ENABLE_SCHEDULER:false}
+  # 时区设置
+  timezone: ${SCHEDULER_TIMEZONE:Asia/Shanghai}
+  # 任务持久化（重启后任务不丢失）
+  persist_jobs: ${SCHEDULER_PERSIST_JOBS:true}
+  # 持久化数据库路径
+  jobs_db_path: ${SCHEDULER_JOBS_DB_PATH:data/scheduler_jobs.db}
+  
+  # 每日爬取任务配置
+  daily_crawl:
+    # 是否启用每日定时爬取
+    enabled: ${DAILY_CRAWL_ENABLED:true}
+    # 执行时间（24小时制）
+    hour: ${DAILY_CRAWL_HOUR:8}
+    minute: ${DAILY_CRAWL_MINUTE:0}
+    # 保留天数（清理多少天前的旧数据）
+    days_to_keep: ${DAILY_CRAWL_DAYS_TO_KEEP:7}
+    # 是否在爬取前清理（False=爬取后清理）
+    clear_before_crawl: ${DAILY_CRAWL_CLEAR_BEFORE:false}
+  
+  # 定时清理任务配置
+  cleanup:
+    # 是否启用定时清理
+    enabled: ${CLEANUP_ENABLED:true}
+    # 执行时间
+    hour: ${CLEANUP_HOUR:3}
+    minute: ${CLEANUP_MINUTE:0}
+    # 保留天数
+    days_to_keep: ${CLEANUP_DAYS_TO_KEEP:30}
+  
+  # 健康检查任务配置
+  health_check:
+    # 是否启用健康检查
+    enabled: ${HEALTH_CHECK_ENABLED:true}
+    # 检查间隔（分钟）
+    interval_minutes: ${HEALTH_CHECK_INTERVAL:60}
+  
+  # 每周清除所有数据任务配置
+  weekly_clear:
+    # 是否启用每周清除所有数据
+    enabled: ${WEEKLY_CLEAR_ENABLED:false}
+    # 执行星期几 (0-6 或 mon-sun)，默认 sun（周日）
+    day_of_week: ${WEEKLY_CLEAR_DAY:sun}
+    # 执行时间（24小时制）
+    hour: ${WEEKLY_CLEAR_HOUR:21}
+    minute: ${WEEKLY_CLEAR_MINUTE:0}
+
+# 日志配置
+logging:
+  level: INFO
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'

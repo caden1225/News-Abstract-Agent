@@ -1,0 +1,5 @@
+name: llm-korean-news
+image: ebanma/llm-agent:llm-korean-news_latest
+extra_args:
+  - "-p 8080:8080"
+  - "-v $HOME/.zebrax:/root/.zebrax"

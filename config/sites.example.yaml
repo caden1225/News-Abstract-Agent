@@ -1,0 +1,132 @@
+# 网站配置文件示例
+# 复制此文件为 sites.yaml 并根据需要修改
+
+sites:
+  # ============================================
+  # 示例1：普通爬虫（单阶段）- 推荐用于大多数网站
+  # ============================================
+  - name: "示例新闻网站"
+    enabled: false  # 改为 true 启用
+    base_url: "https://example.com"
+    encoding: "utf-8"  # 或 "gbk"（中文网站常用）
+    request_delay: 1   # 请求延迟（秒）
+
+    # 实时热榜
+    hot_news:
+      enabled: true
+      url: "https://example.com/hot"
+      max_items: 20
+
+      field_mapping:
+        # 新闻列表容器：选择所有新闻项的父容器
+        container: ".news-list li"  # 或 "ul.news-list > li" 或 "#news-list .item"
+        
+        # 标题（必需）
+        title:
+          selector: "a.title"  # 或 "h2 a" 或 ".title-link"
+          attr: "text"
+        
+        # 链接（必需）
+        url:
+          selector: "a.title"  # 通常和标题是同一个元素
+          attr: "href"
+        
+        # 图片（可选）
+        image_url:
+          selector: "img.thumb"  # 或 ".news-image img"
+          attr: "src"
+        
+        # 发布时间（可选）
+        publish_time:
+          selector: ".time"  # 或 ".publish-time"
+          attr: "text"
+          format: "%Y-%m-%d %H:%M:%S"  # 时间格式，可选
+        
+        # 来源媒体（可选）
+        source:
+          selector: ".source"  # 或 ".media-name"
+          attr: "text"
+        
+        # 描述/摘要（可选）
+        description:
+          selector: ".summary"  # 或 ".abstract"
+          attr: "text"
+
+    # 今日关注（可选，结构类似）
+    today_focus:
+      enabled: false
+      url: "https://example.com/focus"
+      max_items: 15
+      field_mapping:
+        container: ".focus-list .item"
+        title:
+          selector: "h3 a"
+          attr: "text"
+        url:
+          selector: "h3 a"
+          attr: "href"
+
+  # ============================================
+  # 示例2：表格结构的网站
+  # ============================================
+  - name: "表格结构网站示例"
+    enabled: false
+    base_url: "https://table-site.com"
+    encoding: "utf-8"
+    request_delay: 1
+
+    hot_news:
+      enabled: true
+      url: "https://table-site.com/rank"
+      max_items: 15
+
+      field_mapping:
+        container: "table tr"  # 表格行
+        # 方式1：使用列索引（从0开始）
+        title_column_index: 2  # 第3列是标题
+        image_column_index: 1  # 第2列是图片（-1表示没有图片列）
+        
+        # 方式2：使用CSS选择器（推荐，更灵活）
+        # title:
+        #   selector: "td:nth-child(3) a"
+        #   attr: "text"
+        # url:
+        #   selector: "td:nth-child(3) a"
+        #   attr: "href"
+
+  # ============================================
+  # 示例3：两阶段爬虫（列表页+详情页）
+  # ============================================
+  # 注意：如果 common.two_stage_crawl: true，所有网站都会使用两阶段爬虫
+  # 两阶段爬虫会自动访问详情页获取完整内容和图片
+  - name: "两阶段爬虫示例"
+    enabled: false
+    base_url: "https://two-stage-site.com"
+    encoding: "utf-8"
+    request_delay: 2
+    max_concurrent: 10  # 第二阶段并发请求数
+
+    hot_news:
+      enabled: true
+      url: "https://two-stage-site.com/list"
+      max_items: 15
+      
+      field_mapping:
+        container: ".news-list li"
+        title:
+          selector: "a"
+          attr: "text"
+        url:
+          selector: "a"
+          attr: "href"
+        # 两阶段爬虫会自动访问详情页获取完整内容、图片等
+
+# 通用配置
+common:
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+  timeout: 30
+  retry_times: 3
+  retry_delay: 5
+  two_stage_crawl: false  # true=两阶段爬虫，false=普通爬虫
+
+

@@ -1,0 +1,460 @@
+# 网站配置文件
+# 
+# 如何添加新网站：
+# 1. 在 sites: 列表中添加新配置项
+# 2. 配置网站基本信息（name, base_url, encoding等）
+# 3. 配置新闻列表页的CSS选择器（field_mapping）
+# 4. 详细说明请查看 README.md
+#
+# 两种爬虫模式：
+# - 普通爬虫：列表页包含所有信息，直接提取
+# - 两阶段爬虫：列表页只有标题和链接，需要访问详情页获取完整内容
+#   通过 common.two_stage_crawl 控制（true=两阶段，false=普通）
+
+sites:
+  # TopHub - 网易新闻实时热榜（第一阶段：获取新闻列表）
+  - name: "TopHub网易热榜"
+    enabled: true
+    base_url: "https://tophub.today"
+    encoding: "utf-8"
+    request_delay: 2
+    max_concurrent: 10  # 第二阶段最大并发请求数
+
+    hot_news:
+      enabled: true
+      url: "https://tophub.today/n/ENeYa4DeY4"
+      max_items: 15
+
+      # TopHub页面实际结构：table.table tr
+      field_mapping:
+        container: "table.table tr"  # 选择带有class="table"的表格
+        title:
+          selector: "td:nth-child(3) a"
+          attr: "text"
+        url:
+          selector: "td:nth-child(3) a"
+          attr: "href"
+        image_url:
+          selector: "td:nth-child(2) img"
+          attr: "src"
+
+    today_focus:
+      enabled: true
+      # TopHub网易今日关注页面
+      url: "https://tophub.today/n/Ywv4N8XePa"
+      max_items: 15
+
+      field_mapping:
+        container: "table.table tr"
+        # 今日关注页面结构不同，标题在第2列（索引1）
+        title_column_index: 1
+        image_column_index: -1  # 没有图片列
+
+  # 中华网 - 要闻模块
+  - name: "中华网要闻"
+    enabled: true
+    base_url: "https://news.china.com"
+    encoding: "utf-8"
+    request_delay: 2
+    max_concurrent: 10  # 第二阶段最大并发请求数
+
+    # 详情页提取配置
+    detail_config:
+      # 只提取 #js_article_content 中的内容作为正文
+      article_selectors:
+        - '#js_article_content'
+      # 标题选择器（可选，如果不配置则使用默认的 h1, .title, title）
+      # title_selectors:
+      #   - 'h1'
+      #   - '.title'
+      # 时间选择器（可选，如果不配置则使用默认的 .s-ptime, .publish-time, time）
+      # time_selectors:
+      #   - '.publish-time'
+      #   - 'time'
+      # 来源选择器（可选，如果不配置则使用默认的 .s-source, .source）
+      # source_selectors:
+      #   - '.source'
+
+    # 站点特定的后处理配置（会合并到全局配置）
+    # 由于正文已经精确提取，只需要简单的清理即可
+    post_processor:
+      filters:
+        content:
+          # 移除编辑信息
+          - pattern: '\(责任编辑[：:][^)]*\)'
+            action: remove
+            description: "移除责任编辑信息"
+          # 清理多余空行
+          - pattern: '\n\s*\n\s*\n+'
+            action: replace
+            replacement: '\n\n'
+            description: "合并多个空行"
+
+    hot_news:
+      enabled: true
+      url: "https://news.china.com/"
+      max_items: 20
+
+      field_mapping:
+        # 中华网要闻模块：.wp_hot_con 容器直接包含多个 a 标签
+        # 每个 a 标签就是一个新闻项，容器选择器选择这些 a 标签
+        container: ".wp_hot_con a"
+        title:
+          # 容器元素本身就是 a 标签，使用空选择器让代码直接使用容器元素
+          selector: ""
+          attr: "text"
+        url:
+          selector: ""
+          attr: "href"
+        # 图片和时间在详情页获取（两阶段爬虫会自动处理）
+
+  # ============================================
+  # 添加新网站示例（取消注释并修改）：
+  # ============================================
+  #
+  # - name: "新网站名称"
+  #   enabled: true
+  #   base_url: "https://example.com"
+  #   encoding: "utf-8"
+  #   request_delay: 1
+  #
+  #   hot_news:
+  #     enabled: true
+  #     url: "https://example.com/hot"
+  #     max_items: 20
+  #
+  #     field_mapping:
+  #       container: ".news-list li"      # 新闻列表容器
+  #       title:
+  #         selector: "a.title"           # 标题选择器
+  #         attr: "text"                  # 提取文本
+  #       url:
+  #         selector: "a.title"
+  #         attr: "href"                  # 提取链接
+  #       image_url:                      # 可选
+  #         selector: "img.thumb"
+  #         attr: "src"
+  #       publish_time:                   # 可选
+  #         selector: ".time"
+  #         attr: "text"
+  #
+  # 详细配置说明请查看 README.md
+
+  # ============================================
+  # TopHub频道 - 时政、财经、科技、体育
+  # ============================================
+
+  - name: "TopHub时政频道"
+    enabled: true
+    base_url: "https://tophub.today"
+    encoding: "utf-8"
+    request_delay: 2
+    max_concurrent: 10
+    max_items: 30
+
+    hot_news:
+      enabled: true
+      url: "https://tophub.today/n/4Kvx01Pvkx"
+      max_items: 30
+
+      field_mapping:
+        container: "table.table tr"
+        title_column_index: 1
+        image_column_index: 0
+
+    detail_config:
+      # 使用默认的内容提取器
+      article_selectors: []
+      title_selectors: []
+      time_selectors: []
+      source_selectors: []
+
+  - name: "TopHub财经频道"
+    enabled: true
+    base_url: "https://tophub.today"
+    encoding: "utf-8"
+    request_delay: 2
+    max_concurrent: 10
+    max_items: 30
+
+    hot_news:
+      enabled: true
+      url: "https://tophub.today/n/KGoRk0xvl6"
+      max_items: 30
+
+      field_mapping:
+        container: "table.table tr"
+        title_column_index: 1
+        image_column_index: 0
+
+    detail_config:
+      # 使用默认的内容提取器
+      article_selectors: []
+      title_selectors: []
+      time_selectors: []
+      source_selectors: []
+
+  - name: "TopHub科技频道"
+    enabled: true
+    base_url: "https://tophub.today"
+    encoding: "utf-8"
+    request_delay: 2
+    max_concurrent: 10
+    max_items: 30
+
+    hot_news:
+      enabled: true
+      url: "https://tophub.today/n/anopDzEolZ"
+      max_items: 30
+
+      field_mapping:
+        container: "table.table tr"
+        title_column_index: 1
+        image_column_index: 0
+
+    detail_config:
+      # 使用默认的内容提取器
+      article_selectors: []
+      title_selectors: []
+      time_selectors: []
+      source_selectors: []
+
+  # ============================================
+  # 新华网频道 - 财经、国际
+  # ============================================
+
+  - name: "新华网财经"
+    enabled: true
+    base_url: "https://www.news.cn"
+    encoding: "utf-8"
+    request_delay: 2
+    max_concurrent: 8
+    max_items: 20
+
+    hot_news:
+      enabled: true
+      url: "https://www.news.cn/fortune/index.htm"
+      max_items: 20
+
+      field_mapping:
+        container: ".column-center-item"
+        title:
+          selector: ".tit a"
+          attr: "text"
+        url:
+          selector: ".tit a"
+          attr: "href"
+        image_url:
+          selector: ".img img"
+          attr: "src"
+
+    # 详情页配置 - 新华网特定选择器
+    detail_config:
+      article_selectors:
+        - "#detailContent"
+        - "#detail"
+      title_selectors: []
+      time_selectors: []
+      source_selectors: []
+
+  - name: "新华网国际"
+    enabled: true
+    base_url: "https://www.news.cn"
+    encoding: "utf-8"
+    request_delay: 2
+    max_concurrent: 8
+    max_items: 20
+
+    hot_news:
+      enabled: true
+      url: "https://www.news.cn/world/"
+      max_items: 20
+
+      field_mapping:
+        container: ".column-center-item"
+        title:
+          selector: ".tit a"
+          attr: "text"
+        url:
+          selector: ".tit a"
+          attr: "href"
+        image_url:
+          selector: ".img img"
+          attr: "src"
+
+    # 详情页配置 - 新华网特定选择器
+    detail_config:
+      article_selectors:
+        - "#detailContent"
+        - "#detail"
+      title_selectors: []
+      time_selectors: []
+      source_selectors: []
+
+  - name: "新华网汽车"
+    enabled: true
+    base_url: "https://www.news.cn"
+    encoding: "utf-8"
+    request_delay: 2
+    max_concurrent: 8
+    max_items: 15
+
+    hot_news:
+      enabled: true
+      url: "https://www.news.cn/auto/"
+      max_items: 15
+
+      field_mapping:
+        container: ".item"
+        title:
+          selector: ".tit a"
+          attr: "text"
+        url:
+          selector: ".tit a"
+          attr: "href"
+        image_url:
+          selector: ".img img"
+          attr: "src"
+        publish_time:
+          selector: ".time"
+          attr: "text"
+
+    # 详情页配置 - 新华网特定选择器
+    detail_config:
+      article_selectors:
+        - "#detailContent"
+        - "#detail"
+      title_selectors: []
+      time_selectors: []
+      source_selectors: []
+
+  - name: "新华网科技"
+    enabled: true
+    base_url: "https://www.news.cn"
+    encoding: "utf-8"
+    request_delay: 2
+    max_concurrent: 8
+    max_items: 15
+
+    hot_news:
+      enabled: true
+      url: "https://www.news.cn/tech/"
+      max_items: 15
+
+      field_mapping:
+        container: ".item"
+        title:
+          selector: ".tit a"
+          attr: "text"
+        url:
+          selector: ".tit a"
+          attr: "href"
+        image_url:
+          selector: ".img img"
+          attr: "src"
+        publish_time:
+          selector: ".time"
+          attr: "text"
+
+    # 详情页配置 - 新华网特定选择器
+    detail_config:
+      article_selectors:
+        - "#detailContent"
+        - "#detail"
+      title_selectors: []
+      time_selectors: []
+      source_selectors: []
+
+  - name: "新华网娱乐"
+    enabled: true
+    base_url: "https://www.news.cn"
+    encoding: "utf-8"
+    request_delay: 2
+    max_concurrent: 8
+    max_items: 15
+
+    hot_news:
+      enabled: true
+      url: "https://www.news.cn/ent/"
+      max_items: 15
+
+      field_mapping:
+        container: ".item"
+        title:
+          selector: ".tit a"
+          attr: "text"
+        url:
+          selector: ".tit a"
+          attr: "href"
+        image_url:
+          selector: ".img img"
+          attr: "src"
+        publish_time:
+          selector: ".time"
+          attr: "text"
+
+    # 详情页配置 - 新华网特定选择器
+    detail_config:
+      article_selectors:
+        - "#detailContent"
+        - "#detail"
+      title_selectors: []
+      time_selectors: []
+      source_selectors: []
+
+# 通用配置
+common:
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+  timeout: 30
+  retry_times: 3
+  retry_delay: 5
+  two_stage_crawl: true  # 启用两阶段爬取
+  
+  # 全局后处理配置（所有站点共享）
+  post_processor:
+    filters:
+      # 正文内容过滤规则
+      content:
+        # 移除"原标题："开头的行
+        - pattern: '^原标题[：:].*?$'
+          action: remove
+          description: "移除原标题标记行"
+        # 移除"（原标题：...）"格式的文本
+        - pattern: '（原标题[：:][^）]*）'
+          action: remove
+          description: "移除原标题括号内容"
+        # 移除"打开网易新闻 查看更多图片"等提示文本
+        - pattern: '打开.*?查看更多.*?'
+          action: remove
+          description: "移除查看更多提示"
+        # 移除多个连续空行
+        - pattern: '\n\s*\n\s*\n+'
+          action: replace
+          replacement: '\n\n'
+          description: "合并多个空行"
+      
+      # 图片URL过滤规则
+      image_urls:
+        # 过滤空图片占位符（使用原始字符串格式）
+        - pattern: '.*empty\\.png.*'
+          action: remove
+          description: "移除空图片占位符"
+        # 过滤logo图片
+        - pattern: '.*logo.*'
+          action: remove
+          description: "移除logo图片"
+        # 过滤静态资源中的占位图
+        - pattern: '.*static.*empty.*'
+          action: remove
+          description: "移除静态占位图"
+        # 过滤网易新闻的占位图
+        - pattern: '.*static\\.ws\\.126\\.net.*empty\\.png.*'
+          action: remove
+          description: "移除网易新闻占位图"
+      
+      # 标题过滤规则
+      title:
+        # 移除标题中的"原标题："前缀（保留后面的内容）
+        - pattern: '^原标题[：:]\\s*'
+          action: remove
+          description: "移除标题中的原标题前缀"
