@@ -213,8 +213,9 @@ class LLMService(object):
 
         Yields:
             (token_type, token_content) 元组
-            - token_type: "thinking" 或 "content"
-            - token_content: token 内容
+            - token_type: "thinking"、"content" 或 "done"
+            - token_content: token 内容（"done" 时为空字符串）
+            - "done" 表示流式响应已结束
 
         Raises:
             LLMError: 调用失败时抛出异常
@@ -281,6 +282,9 @@ class LLMService(object):
                 # 常规内容
                 if delta.content:
                     yield ("content", delta.content)
+            
+            # 流式响应结束，发送明确的结束信号
+            yield ("done", "")
                     
         except Exception as e:
             logger.error(f"LLM stream call failed: {e}", exc_info=True)

@@ -413,6 +413,7 @@ class NewsAgentOrchestrator:
             Yields:
                 SSE格式的音频帧响应
             """
+            nonlocal frame_id  # 使用外层计数器
             while chunks_list:
                 audio_chunk_data = chunks_list.pop(0)
                 frame_id += 1
@@ -434,6 +435,11 @@ class NewsAgentOrchestrator:
                 max_tokens=LLM_CONFIG.SUMMARY_MAX_TOKENS,
                 enable_thinking=enable_thinking
             ):
+                # 处理结束信号
+                if token_type == "done":
+                    logger.info(f"LLM流式响应结束: request_id={request_id}")
+                    break
+                
                 # 在每次LLM token到来时，先yield所有待处理的音频块
                 async for audio_frame in process_and_yield_audio_chunks(pending_audio_chunks):
                     yield audio_frame
@@ -451,7 +457,7 @@ class NewsAgentOrchestrator:
                         request_id=request_id
                     )
                     
-                else:  # content token
+                elif token_type == "content":  # content token
                     # 第一个 content token 表示 thinking 阶段结束
                     if in_thinking_phase:
                         in_thinking_phase = False
@@ -490,11 +496,9 @@ class NewsAgentOrchestrator:
             except:
                 pass  # 队列可能已满，忽略
             
-            # 等待音频队列处理完成（优化：等待TTS任务完成）
+            # 优化：非阻塞等待TTS任务完成，在等待期间持续yield音频块
             if tts_task:
                 text_length = len(content_buffer)
-
-                # 方案B优化：改为等待TTS任务完成，确保所有音频都生成
                 max_wait_for_tts = float(config.get("tts.orchestrator.max_wait_for_tts", 30.0))
 
                 logger.info(
@@ -502,23 +506,89 @@ class NewsAgentOrchestrator:
                     f"文本长度={text_length}字符, 超时={max_wait_for_tts}秒"
                 )
 
-                try:
-                    # 等待TTS任务完成，而不是仅仅检查队列
-                    await asyncio.wait_for(tts_task, timeout=max_wait_for_tts)
-                    logger.info(f"✅ TTS任务已完成: request_id={request_id}")
-
-                    # TTS任务完成后，再等待一小段时间让音频监控任务处理完剩余音频
-                    await asyncio.sleep(0.5)
-
-                    # 检查并处理所有剩余音频
-                    while not audio_queue.empty() or pending_audio_chunks:
-                        await asyncio.sleep(0.1)
-
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        f"⚠️ TTS任务超时（{max_wait_for_tts}秒）: request_id={request_id}, "
-                        f"已生成部分音频"
-                    )
+                # 非阻塞等待：在等待TTS完成的同时，持续yield音频块
+                start_wait_time = time.time()
+                tts_completed = False
+                
+                while not tts_completed:
+                    # 检查TTS任务是否已完成
+                    if tts_task.done():
+                        try:
+                            await tts_task  # 获取结果或异常
+                            tts_completed = True
+                            logger.info(f"✅ TTS任务已完成: request_id={request_id}")
+                        except Exception as e:
+                            logger.error(f"TTS任务异常: {e}", exc_info=True)
+                            tts_completed = True
+                        break
+                    
+                    # 检查是否超时
+                    elapsed = time.time() - start_wait_time
+                    if elapsed >= max_wait_for_tts:
+                        logger.warning(
+                            f"⚠️ TTS任务超时（{max_wait_for_tts}秒）: request_id={request_id}, "
+                            f"已生成部分音频"
+                        )
+                        break
+                    
+                    # 先yield所有待处理的音频块（非阻塞）
+                    if pending_audio_chunks or audio_ready_event.is_set():
+                        async for audio_frame in process_and_yield_audio_chunks(pending_audio_chunks):
+                            yield audio_frame
+                        audio_ready_event.clear()
+                    
+                    # 也检查原始音频队列（非阻塞）
+                    while not audio_queue.empty():
+                        try:
+                            audio_chunk_data = audio_queue.get_nowait()
+                            pending_audio_chunks.append(audio_chunk_data)
+                        except asyncio.QueueEmpty:
+                            break
+                    
+                    # 如果还有待处理的音频块，立即yield
+                    if pending_audio_chunks:
+                        async for audio_frame in process_and_yield_audio_chunks(pending_audio_chunks):
+                            yield audio_frame
+                        continue
+                    
+                    # 等待一小段时间，避免CPU占用过高（但不要太长，保证响应速度）
+                    # 使用 asyncio.wait_for 等待音频事件或短暂超时
+                    try:
+                        await asyncio.wait_for(
+                            audio_ready_event.wait(),
+                            timeout=0.1  # 100ms超时，快速响应
+                        )
+                    except asyncio.TimeoutError:
+                        # 超时，继续检查TTS任务状态
+                        continue
+                
+                # TTS任务完成后，再等待一小段时间让音频监控任务处理完剩余音频
+                await asyncio.sleep(0.2)
+                
+                # 最后处理所有剩余的音频块
+                while pending_audio_chunks or not audio_queue.empty():
+                    # 处理pending列表
+                    async for audio_frame in process_and_yield_audio_chunks(pending_audio_chunks):
+                        yield audio_frame
+                    
+                    # 从队列中获取更多音频块
+                    while not audio_queue.empty():
+                        try:
+                            audio_chunk_data = audio_queue.get_nowait()
+                            pending_audio_chunks.append(audio_chunk_data)
+                        except asyncio.QueueEmpty:
+                            break
+                    
+                    # 如果还有待处理的，继续yield
+                    if pending_audio_chunks:
+                        async for audio_frame in process_and_yield_audio_chunks(pending_audio_chunks):
+                            yield audio_frame
+                    else:
+                        # 没有更多音频块，退出循环
+                        break
+                    
+                    # 短暂等待，避免CPU占用过高
+                    await asyncio.sleep(0.05)
             else:
                 logger.warning(f"⚠️ TTS任务未启动: request_id={request_id}")
             

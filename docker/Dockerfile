@@ -1,6 +1,6 @@
 # Python Agent Dockerfile for News TTS Agent
 # 使用与参考项目相同的基础镜像
-FROM news-agent-dev:20260119_ready_1
+FROM news-agent-dev:20260119_ready_3
 
 # 指定运行时的系统环境变量
 ENV APP_NAME=news-tts-agent \
@@ -16,6 +16,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # 复制依赖文件
 COPY requirements.txt /tmp/requirements.txt
+# RUN pip install --no-cache-dir -i http://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com -r /tmp/requirements.txt
 # COPY /home/caden/c2_module /home/caden/c2_module  # 注释：该目录不在构建上下文中，如需使用请先将其复制到构建上下文或使用相对路径
 # # 安装Python依赖
 # RUN eval "$(micromamba shell hook --shell bash)" && \

@@ -179,10 +179,12 @@ async def summarizer_node(state: NewsAgentState) -> Dict[str, Any]:
             max_tokens=LLM_CONFIG.SUMMARY_MAX_TOKENS,
             enable_thinking=enable_thinking  # 使用API参数或配置文件设置
         ):
-            if token_type == "thinking":
+            if token_type == "done":
+                break  # 流式响应结束
+            elif token_type == "thinking":
                 thinking_content += token_content
                 print(token_content, end="", flush=True)  # 实时显示思考进度
-            else:
+            elif token_type == "content":
                 accumulated_text += token_content
                 print(f".", end="", flush=True)  # 实时显示生成进度
 
