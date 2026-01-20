@@ -12,6 +12,10 @@ _PROJECT_ROOT = Path(__file__).parent.parent
 DEFAULT_CONFIG_PATH = str(_PROJECT_ROOT / "config" / "sites.yaml")
 DEFAULT_DB_PATH = str(_PROJECT_ROOT / "data" / "news.db")
 
+# 初始化日志配置
+from .logger_config import setup_crawler_logging
+setup_crawler_logging()
+
 from .client import NewsCrawlerAPI
 from .database import Database
 from models.news import NewsItem

@@ -13,6 +13,9 @@ import requests
 from bs4 import BeautifulSoup
 from models.news import NewsItem
 from ..database import Database
+from ..logger_config import get_crawler_logger
+
+logger = get_crawler_logger(__name__)
 
 
 class BaseCrawler(ABC):
@@ -53,11 +56,11 @@ class BaseCrawler(ABC):
                 response.encoding = self.encoding
                 return response
             except Exception as e:
-                print(f"请求失败 (尝试 {attempt + 1}/{max_retries}): {url}")
-                print(f"错误: {e}")
+                logger.debug(f"请求失败 (尝试 {attempt + 1}/{max_retries}): {url}, 错误: {e}")
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
                 else:
+                    logger.warning(f"请求最终失败: {url}")
                     return None
 
     def _parse_datetime(self, date_str: str, format_str: str = None) -> Optional[datetime]:
@@ -122,7 +125,7 @@ class BaseCrawler(ABC):
                     return value
                 return None
         except Exception as e:
-            print(f"提取字段失败 [{selector}]: {e}")
+            logger.debug(f"提取字段失败 [{selector}]: {e}")
             return None
 
     def _parse_news_item(self, item_element, field_mapping: Dict, category: str) -> Optional[NewsItem]:
@@ -170,7 +173,7 @@ class BaseCrawler(ABC):
                 description=description
             )
         except Exception as e:
-            print(f"解析新闻项失败: {e}")
+            logger.debug(f"解析新闻项失败: {e}")
             return None
 
     def _fetch_category(self, category_config: Dict, category_name: str) -> List[NewsItem]:
@@ -183,21 +186,22 @@ class BaseCrawler(ABC):
         field_mapping = category_config.get('field_mapping', {})
 
         if not url:
-            print(f"未配置URL: {category_name}")
+            logger.warning(f"未配置URL: {category_name}")
             return []
 
-        print(f"\n正在抓取 [{self.name}] - {category_name}: {url}")
+        logger.info(f"正在抓取 [{self.name}] - {category_name}")
+        logger.debug(f"抓取URL: {url}")
 
         response = self._make_request(url)
         if not response:
-            print(f"请求失败: {url}")
+            logger.warning(f"请求失败: {url}")
             return []
 
         soup = BeautifulSoup(response.text, 'html.parser')
         container_selector = field_mapping.get('container', '')
 
         if not container_selector:
-            print("未配置容器选择器")
+            logger.warning("未配置容器选择器")
             return []
 
         items = soup.select(container_selector)
@@ -207,7 +211,7 @@ class BaseCrawler(ABC):
             news_item = self._parse_news_item(item_element, field_mapping, category_name)
             if news_item:
                 news_list.append(news_item)
-                print(f"  ✓ {news_item.title[:50]}...")
+                logger.debug(f"  ✓ {news_item.title[:50]}...")
 
         # 添加延迟
         if self.request_delay > 0:
@@ -217,9 +221,7 @@ class BaseCrawler(ABC):
 
     def crawl(self) -> Dict[str, List[NewsItem]]:
         """执行爬取任务"""
-        print(f"\n{'='*60}")
-        print(f"开始爬取: {self.name}")
-        print(f"{'='*60}")
+        logger.info(f"开始爬取: {self.name}")
 
         results = {}
 
@@ -250,11 +252,11 @@ class GenericCrawler(BaseCrawler):
         total_saved = 0
 
         for category, news_list in results.items():
-            print(f"\n{category} 抓取到 {len(news_list)} 条新闻")
+            logger.info(f"{category} 抓取到 {len(news_list)} 条新闻")
 
             if news_list:
                 saved_count = self.database.insert_news_batch(news_list)
                 total_saved += saved_count
-                print(f"  保存了 {saved_count} 条到数据库")
+                logger.info(f"保存了 {saved_count} 条到数据库")
 
         return total_saved

@@ -239,7 +239,7 @@ class CosyVoice2(CosyVoice):
                             yield text_token
             
             # 获取说话人embedding
-            embedding = self.frontend.spk2info[spk_id]['embedding']
+            embedding = self.frontend.spk2info[spk_id]['llm_embedding']
             # 确保 embedding 是2维的 (1, embedding_dim)
             if embedding.dim() == 1:
                 embedding = embedding.unsqueeze(0)
@@ -358,7 +358,7 @@ class CosyVoice3(CosyVoice2):
                             yield text_token
             
             # 获取说话人embedding
-            embedding = self.frontend.spk2info[spk_id]['embedding']
+            embedding = self.frontend.spk2info[spk_id]['llm_embedding']
             # 确保 embedding 是2维的 (1, embedding_dim)
             if embedding.dim() == 1:
                 embedding = embedding.unsqueeze(0)

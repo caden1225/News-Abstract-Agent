@@ -11,6 +11,9 @@ from ..database import Database
 from .base_crawler import GenericCrawler
 from .two_stage_crawler import TwoStageCrawler
 from ..post_processor import create_processor_from_config
+from ..logger_config import get_crawler_logger
+
+logger = get_crawler_logger(__name__)
 
 
 class CrawlerManager:
@@ -30,7 +33,7 @@ class CrawlerManager:
     def load_config(self):
         """加载配置文件"""
         if not os.path.exists(self.config_path):
-            print(f"配置文件不存在: {self.config_path}")
+            logger.error(f"配置文件不存在: {self.config_path}")
             return
 
         with open(self.config_path, 'r', encoding='utf-8') as f:
@@ -62,30 +65,28 @@ class CrawlerManager:
                     # 使用两阶段爬虫
                     crawler = TwoStageCrawler(site_config, site_database)
                     self.crawlers.append(crawler)
-                    print(f"已加载两阶段爬虫: {crawler.name}")
+                    logger.debug(f"已加载两阶段爬虫: {crawler.name}")
                 else:
                     # 使用普通爬虫
                     crawler = GenericCrawler(site_config, site_database)
                     self.crawlers.append(crawler)
-                    print(f"已加载爬虫: {crawler.name}")
+                    logger.debug(f"已加载爬虫: {crawler.name}")
 
-        print(f"\n总共加载了 {len(self.crawlers)} 个爬虫")
+        logger.info(f"总共加载了 {len(self.crawlers)} 个爬虫")
 
     def run_all(self) -> Dict[str, int]:
         """运行所有爬虫"""
         results = {}
 
         for crawler in self.crawlers:
-            print(f"\n{'#'*60}")
-            print(f"# 运行爬虫: {crawler.name}")
-            print(f"{'#'*60}")
+            logger.info(f"运行爬虫: {crawler.name}")
 
             try:
                 count = crawler.run()
                 results[crawler.name] = count
-                print(f"✓ {crawler.name} 完成，抓取了 {count} 条新闻")
+                logger.info(f"{crawler.name} 完成，抓取了 {count} 条新闻")
             except Exception as e:
-                print(f"✗ {crawler.name} 失败: {e}")
+                logger.error(f"{crawler.name} 失败: {e}", exc_info=True)
                 results[crawler.name] = 0
 
         return results
@@ -95,7 +96,7 @@ class CrawlerManager:
         for crawler in self.crawlers:
             if crawler.name == site_name:
                 return crawler.run()
-        print(f"未找到爬虫: {site_name}")
+        logger.warning(f"未找到爬虫: {site_name}")
         return 0
 
     def get_statistics(self):

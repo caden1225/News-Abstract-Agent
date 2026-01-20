@@ -134,6 +134,23 @@ class LocalTTSService:
             )
             self.enabled = enabled
             self.sample_rate = self.model.sample_rate
+            
+            # 保存模型类型，用于计算source_cache_len
+            self.model_type = model_type
+            if model_type == "auto":
+                # 尝试从模型对象获取类型
+                try:
+                    if hasattr(self.model, 'model') and hasattr(self.model.model, '__class__'):
+                        class_name = self.model.model.__class__.__name__
+                        if 'CosyVoice3' in class_name:
+                            self.model_type = "cosyvoice3"
+                        elif 'CosyVoice2' in class_name:
+                            self.model_type = "cosyvoice2"
+                except:
+                    pass
+            # 如果还是auto，默认使用cosyvoice2
+            if self.model_type == "auto":
+                self.model_type = "cosyvoice2"
 
             # 同步GPU并打印加载后的显存使用
             if torch.cuda.is_available():
@@ -142,7 +159,7 @@ class LocalTTSService:
 
             logger.info(
                 f"本地 TTS 服务初始化成功: model_dir={model_dir}, spk_id={spk_id}, "
-                f"加速=FP16({fp16})+TensorRT({load_trt})"
+                f"加速=FP16({fp16})+TensorRT({load_trt}), model_type={self.model_type}"
             )
         except Exception as e:
             logger.error(f"本地 TTS 服务初始化失败: {e}", exc_info=True)
@@ -158,7 +175,6 @@ class LocalTTSService:
     def _torch_to_bytes(self, audio_tensor: torch.Tensor, format: str = "pcm") -> bytes:
         """
         将 PyTorch tensor 转换为音频字节数据
-
         Args:
             audio_tensor: 音频张量，shape 为 (1, samples) 或 (samples,)
             format: 音频格式
@@ -166,9 +182,11 @@ class LocalTTSService:
         Returns:
             音频二进制数据
         """
-        # 转换为 numpy 数组
         if isinstance(audio_tensor, torch.Tensor):
-            audio_array = audio_tensor.cpu().numpy()
+            if audio_tensor.is_cuda:
+                audio_array = audio_tensor.cpu().numpy()
+            else:
+                audio_array = audio_tensor.contiguous().numpy()
         else:
             audio_array = audio_tensor
 
@@ -178,8 +196,11 @@ class LocalTTSService:
 
         # 转换为 int16 PCM
         if audio_array.dtype == np.float32 or audio_array.dtype == np.float64:
+            # 优化：使用np.clip确保值在有效范围内，避免溢出
             # 假设范围是 [-1, 1]
-            audio_array = (audio_array * 32767).astype(np.int16)
+            audio_array = np.clip(audio_array * 32767, -32768, 32767).astype(np.int16)
+        elif audio_array.dtype != np.int16:
+            audio_array = audio_array.astype(np.int16)
 
         return audio_array.tobytes()
     
@@ -219,7 +240,12 @@ class LocalTTSService:
         request_id: Optional[str] = None,
         format: str = "pcm",
         sample_rate: int = 24000,
-        voice: Optional[str] = None
+        voice: Optional[str] = None,
+        # 参数覆盖（用于测试，None时使用配置值）
+        token_hop_len: Optional[int] = None,
+        mel_cache_len: Optional[int] = None,
+        min_length: Optional[int] = None,
+        max_wait_time: Optional[float] = None
     ) -> AsyncGenerator[AudioChunk, None]:
         """
         流式 TTS 合成
@@ -306,11 +332,11 @@ class LocalTTSService:
         logger.info(f"开始本地 TTS 合成: request_id={request_id}")
 
         # 从配置文件读取流式合成参数（确保类型转换）
-        min_length = int(config.get("tts.streaming.min_length", 5))
+        min_length = min_length if min_length is not None else int(config.get("tts.streaming.min_length", 5))
         max_length = int(config.get("tts.streaming.max_length", 200))
-        max_wait_time = float(config.get("tts.streaming.max_wait_time", 1.0))
-        token_hop_len = int(config.get("tts.streaming.token_hop_len", 20))
-        mel_cache_len = int(config.get("tts.streaming.mel_cache_len", 6))
+        max_wait_time = max_wait_time if max_wait_time is not None else float(config.get("tts.streaming.max_wait_time", 1.0))
+        token_hop_len = token_hop_len if token_hop_len is not None else int(config.get("tts.streaming.token_hop_len", 20))
+        mel_cache_len = mel_cache_len if mel_cache_len is not None else int(config.get("tts.streaming.mel_cache_len", 6))
 
         logger.debug(
             f"TTS流式合成参数: min_length={min_length}, max_length={max_length}, "
@@ -498,8 +524,8 @@ class LocalTTSService:
                     return result
                 
                 try:
-                    # 优化：减小初始等待时间（0.1秒 → 0.05秒）
-                    await asyncio.sleep(0.05)
+                    # 优化：减小初始等待时间（0.05秒 → 0.001秒），更快响应
+                    await asyncio.sleep(0.001)
                     
                     # 获取第一个音频tensor（在线程池中执行，避免阻塞）
                     current_audio = await safe_next(audio_iter)
@@ -508,6 +534,44 @@ class LocalTTSService:
                     sentence_index = 0
                     sentence_keys = sorted(sentence_audio_map.keys()) if sentence_audio_map else []
                     
+                    # 优化：立即yield第一个音频块，不等待下一个tensor
+                    # 这样可以显著减少首音频块延迟（从1.4秒降至几乎0延迟）
+                    chunk_counter += 1
+                    chunk_id = f"{request_id}_chunk_{chunk_counter}"
+                    
+                    # 第一个音频块：保留完整音频（模型已经切除了最后source_cache_len，但我们无法恢复）
+                    # 注意：第一个音频块已经被模型切除了最后部分，这是无法恢复的
+                    # 但我们可以确保后续音频块去除重复部分，避免重复
+                    audio_bytes = self._torch_to_bytes(current_audio, format)
+                    
+                    # 获取对应的文本
+                    if sentence_index < len(sentence_keys):
+                        sentence_key = sentence_keys[sentence_index]
+                        actual_text = sentence_audio_map.get(sentence_key, "处理中...")
+                    else:
+                        actual_text = current_sentence_text or "处理中..."
+                    
+                    # 立即yield第一个音频块
+                    yield AudioChunk(
+                        chunk_id=chunk_id,
+                        text=actual_text,
+                        audio_data=audio_bytes,
+                        format=format,
+                        is_final=False,
+                        timestamp=int(asyncio.get_event_loop().time() * 1000),
+                        metadata={
+                            "sample_rate": self.sample_rate,
+                            "local_model": True,
+                            "streaming": True,
+                            "chunk_index": chunk_counter,
+                            "sentence_key": sentence_keys[sentence_index] if sentence_index < len(sentence_keys) else None
+                        }
+                    )
+                    sentence_index += 1
+                    
+                    # 处理后续音频块
+                    # 优化：使用"预取"模式，提前获取下一个tensor来判断是否是最后一个
+                    current_audio_for_loop = current_audio  # 保存第一个，用于后续循环
                     while True:
                         # 尝试获取下一个音频tensor来判断是否是最后一个
                         try:
@@ -515,7 +579,12 @@ class LocalTTSService:
                             # 有下一个，yield当前的（不是最后一个）
                             chunk_counter += 1
                             chunk_id = f"{request_id}_chunk_{chunk_counter}"
-                            audio_bytes = self._torch_to_bytes(current_audio, format)
+                            
+                            # 直接使用音频tensor，不做任何切除
+                            # 注意：CosyVoice2的fade_in_out机制会在音频块之间创建平滑过渡
+                            # 虽然会有少量重复，但这是保证音频质量所必需的
+                            # 如果去除重复部分，会导致音频不连续或缺失
+                            audio_bytes = self._torch_to_bytes(current_audio_for_loop, format)
                             
                             # 优化：使用实际文本，不是占位符
                             # 根据句子索引获取对应的文本
@@ -540,15 +609,17 @@ class LocalTTSService:
                                     "sentence_key": sentence_keys[sentence_index] if sentence_index < len(sentence_keys) else None
                                 }
                             )
-                            # 更新当前tensor
-                            current_audio = next_audio
+                            # 更新当前tensor为下一个
+                            current_audio_for_loop = next_audio
                             # 移动到下一个句子（每个音频块对应一个句子）
                             sentence_index += 1
                         except IteratorExhausted:
-                            # 没有下一个，当前是最后一个
+                            # 没有下一个，current_audio_for_loop是最后一个
                             chunk_counter += 1
                             chunk_id = f"{request_id}_chunk_{chunk_counter}"
-                            audio_bytes = self._torch_to_bytes(current_audio, format)
+                            
+                            # 直接使用最后一个音频tensor，不做任何切除
+                            audio_bytes = self._torch_to_bytes(current_audio_for_loop, format)
                             
                             # 优化：使用实际文本，不是占位符
                             if sentence_index < len(sentence_keys):

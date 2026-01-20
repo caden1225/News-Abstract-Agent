@@ -6,9 +6,12 @@
 
 import re
 from typing import List, Optional, Dict, TYPE_CHECKING
+from .logger_config import get_crawler_logger
 
 if TYPE_CHECKING:
     from models.news import NewsItem
+
+logger = get_crawler_logger(__name__)
 
 
 class PostProcessor:
@@ -63,7 +66,7 @@ class PostProcessor:
                     }
                     compiled[field].append(compiled_rule)
                 except re.error as e:
-                    print(f"警告: 无效的正则表达式 [{pattern}]: {e}")
+                    logger.warning(f"无效的正则表达式 [{pattern}]: {e}")
         
         return compiled
     

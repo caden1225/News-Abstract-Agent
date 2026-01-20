@@ -9,8 +9,9 @@ from typing import List, Dict, Optional
 import json
 from .post_processor import PostProcessor
 from models.news import NewsItem
+from .logger_config import get_crawler_logger
 
-logger = logging.getLogger(__name__)
+logger = get_crawler_logger(__name__)
 
 
 class Database:
@@ -333,7 +334,7 @@ class Database:
             
             return news_id
         except sqlite3.Error as e:
-            print(f"插入数据失败: {e}")
+            logger.error(f"插入数据失败: {e}", exc_info=True)
             return -1
         # 注意：不关闭连接，因为这是共享的连接池连接
 
@@ -440,7 +441,7 @@ class Database:
                     success_count += 1
                     inserted_urls.append((news.url, news.source_site, news.category))
                 except sqlite3.Error as e:
-                    print(f"插入新闻失败 [{news.title}]: {e}")
+                    logger.debug(f"插入新闻失败 [{news.title}]: {e}")
 
             conn.commit()
             
@@ -448,7 +449,7 @@ class Database:
             if inserted_urls:
                 self.mark_urls_crawled([url for url, _, _ in inserted_urls])
         except sqlite3.Error as e:
-            print(f"批量插入失败: {e}")
+            logger.error(f"批量插入失败: {e}", exc_info=True)
         # 注意：不关闭连接，因为这是共享的连接池连接
 
         return success_count
@@ -679,7 +680,7 @@ class Database:
             """, (url, source_site, category, now))
             conn.commit()
         except sqlite3.Error as e:
-            print(f"标记URL失败 [{url}]: {e}")
+            logger.debug(f"标记URL失败 [{url}]: {e}")
         # 注意：不关闭连接，因为这是共享的连接池连接
     
     def mark_urls_crawled(self, urls: List[str], source_site: str = None, category: str = None):
@@ -696,7 +697,7 @@ class Database:
                     VALUES (?, ?, ?, ?)
                 """, (url, source_site, category, now))
             except sqlite3.Error as e:
-                print(f"标记URL失败 [{url}]: {e}")
+                logger.debug(f"标记URL失败 [{url}]: {e}")
         
         conn.commit()
         # 注意：不关闭连接，因为这是共享的连接池连接

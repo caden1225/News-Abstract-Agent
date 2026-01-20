@@ -15,6 +15,9 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from models.news import NewsItem
 from ..database import Database
+from ..logger_config import get_crawler_logger
+
+logger = get_crawler_logger(__name__)
 
 
 class TwoStageCrawler:
@@ -123,11 +126,11 @@ class TwoStageCrawler:
         field_mapping = category_config.get('field_mapping', {})
 
         if not url:
-            print(f"未配置URL: {category_name}")
+            logger.warning(f"未配置URL: {category_name}")
             return []
 
-        print(f"\n第一阶段：抓取 [{self.name}] - {category_name}")
-        print(f"URL: {url}")
+        logger.info(f"第一阶段：抓取 [{self.name}] - {category_name}")
+        logger.debug(f"URL: {url}")
 
         session = self._get_sync_session()
         max_retries = self._common_config.get('retry_times', 3)
@@ -140,18 +143,18 @@ class TwoStageCrawler:
                 response.encoding = self.encoding
                 break
             except Exception as e:
-                print(f"  请求失败 (尝试 {attempt + 1}/{max_retries}): {url}")
-                print(f"  错误: {e}")
+                logger.debug(f"请求失败 (尝试 {attempt + 1}/{max_retries}): {url}, 错误: {e}")
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
                 else:
+                    logger.warning(f"请求最终失败: {url}")
                     return []
 
         soup = BeautifulSoup(response.text, 'html.parser')
         container_selector = field_mapping.get('container', '')
 
         if not container_selector:
-            print("未配置容器选择器")
+            logger.warning("未配置容器选择器")
             return []
 
         items = soup.select(container_selector)
@@ -284,17 +287,17 @@ class TwoStageCrawler:
                         'image_urls': image_urls,
                         'source': source
                     })
-                    print(f"  ✓ {title[:50]}...")
+                    logger.debug(f"  ✓ {title[:50]}...")
 
             except Exception as e:
-                print(f"  解析失败: {e}")
+                logger.debug(f"解析失败: {e}")
                 continue
 
         # 添加延迟
         if self.request_delay > 0:
             time.sleep(self.request_delay + random.uniform(0, 1))
 
-        print(f"\n第一阶段完成：获取了 {len(news_list)} 条新闻链接")
+        logger.info(f"第一阶段完成：获取了 {len(news_list)} 条新闻链接")
         
         # 过滤掉已抓取的URL（在第一阶段就去重，避免不必要的详情页请求）
         if news_list:
@@ -303,16 +306,16 @@ class TwoStageCrawler:
             
             if len(new_urls) < len(urls):
                 skipped_count = len(urls) - len(new_urls)
-                print(f"  跳过已抓取的URL: {skipped_count} 条")
+                logger.debug(f"跳过已抓取的URL: {skipped_count} 条")
                 # 只保留未抓取的新闻
                 news_list = [item for item in news_list if item['url'] in new_urls]
-                print(f"  待抓取: {len(news_list)} 条")
+                logger.info(f"待抓取: {len(news_list)} 条")
         
         return news_list
 
     async def _fetch_news_detail_async(self, session: aiohttp.ClientSession, news_url: str, basic_info: Dict) -> Optional[NewsItem]:
         """第二阶段：异步获取新闻详细内容"""
-        print(f"    第二阶段: {basic_info['title'][:40]}...")
+        logger.debug(f"第二阶段: {basic_info['title'][:40]}...")
 
         try:
             # 对于中华网，尝试先访问全文页面（如果存在）
@@ -527,7 +530,7 @@ class TwoStageCrawler:
             )
 
         except Exception as e:
-            print(f"    获取详情失败: {e}")
+            logger.debug(f"获取详情失败: {e}")
             # 即使详情获取失败，也返回基本信息
             fallback_image_urls = basic_info.get('image_urls', [])
             # 即使在异常情况下，也要提取标签
@@ -560,8 +563,8 @@ class TwoStageCrawler:
         connector = aiohttp.TCPConnector(limit=self.max_concurrent)
         timeout = aiohttp.ClientTimeout(total=30)
 
-        print(f"\n第二阶段：并行获取 {len(news_list)} 条新闻详细内容...")
-        print(f"并发数: {self.max_concurrent}")
+        logger.info(f"第二阶段：并行获取 {len(news_list)} 条新闻详细内容...")
+        logger.debug(f"并发数: {self.max_concurrent}")
 
         async with aiohttp.ClientSession(headers=headers, connector=connector, timeout=timeout) as session:
             # 创建所有任务
@@ -575,15 +578,13 @@ class TwoStageCrawler:
 
         # 过滤掉None结果
         detailed_news = [news for news in detailed_news if news is not None]
-        print(f"\n第二阶段完成：成功获取 {len(detailed_news)} 条详细新闻")
+        logger.info(f"第二阶段完成：成功获取 {len(detailed_news)} 条详细新闻")
 
         return detailed_news
 
     def crawl(self) -> Dict[str, List[NewsItem]]:
         """执行两阶段爬取（异步并行版本）"""
-        print(f"\n{'='*60}")
-        print(f"开始两阶段爬取: {self.name}")
-        print(f"{'='*60}")
+        logger.info(f"开始两阶段爬取: {self.name}")
 
         results = {}
 
@@ -612,11 +613,11 @@ class TwoStageCrawler:
         total_saved = 0
 
         for category, news_list in results.items():
-            print(f"\n{category} 获取到 {len(news_list)} 条新闻")
+            logger.info(f"{category} 获取到 {len(news_list)} 条新闻")
 
             if news_list:
                 saved_count = self.database.insert_news_batch(news_list)
                 total_saved += saved_count
-                print(f"  保存了 {saved_count} 条到数据库")
+                logger.info(f"保存了 {saved_count} 条到数据库")
 
         return total_saved

@@ -9,6 +9,9 @@ from pathlib import Path
 from models.news import NewsItem
 from .database import Database
 from .crawlers.manager import CrawlerManager
+from .logger_config import get_crawler_logger
+
+logger = get_crawler_logger(__name__)
 
 
 class NewsCrawlerAPI:
@@ -54,7 +57,7 @@ class NewsCrawlerAPI:
             示例: {"TopHub网易热榜": 15, "网易新闻今日推荐": 10}
         """
         if self.verbose:
-            print(f"开始运行所有爬虫...")
+            logger.info("开始运行所有爬虫...")
         
         results = self.manager.run_all()
         
@@ -64,7 +67,7 @@ class NewsCrawlerAPI:
         
         if self.verbose:
             total = sum(results.values())
-            print(f"爬取完成，共抓取 {total} 条新闻")
+            logger.info(f"爬取完成，共抓取 {total} 条新闻")
         
         return results
     
@@ -79,12 +82,12 @@ class NewsCrawlerAPI:
             抓取的新闻数量
         """
         if self.verbose:
-            print(f"开始运行爬虫: {site_name}")
+            logger.info(f"开始运行爬虫: {site_name}")
         
         count = self.manager.run_crawler(site_name)
         
         if self.verbose:
-            print(f"完成，抓取了 {count} 条新闻")
+            logger.info(f"完成，抓取了 {count} 条新闻")
         
         return count
     
@@ -212,7 +215,7 @@ class NewsCrawlerAPI:
         except Exception as e:
             # 记录错误但不抛出，返回None表示未找到
             if self.verbose:
-                print(f"查询新闻失败 [{url}]: {e}")
+                logger.debug(f"查询新闻失败 [{url}]: {e}")
             return None
         # 注意：不关闭连接，因为这是共享的连接池连接
     
