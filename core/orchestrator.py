@@ -11,16 +11,21 @@
 import time
 import asyncio
 import logging
-from typing import AsyncGenerator, Dict, Any, List, Optional
+from typing import AsyncGenerator
 
-from core.graph.workflow import build_news_workflow, build_preprocessing_workflow
+from core.graph.workflow import build_preprocessing_workflow
 from models.state import NewsAgentState
 from prompts import build_news_summary_messages
 from core.utils import build_debug_info_from_state
 from core.response_builder import ResponseBuilder
 from core.tts_stream_processor import TTSStreamProcessor
 from llm_utils.config import config
+from llm_utils.llm_service import LLMService, llm_config
+from core.constants import LLM_CONFIG
+from tts_utils import get_tts_service
+from tts_utils.tts_optimization_utils import BackpressureController, AdaptiveTimeout
 
+   
 logger = logging.getLogger(__name__)
 
 
@@ -29,15 +34,48 @@ class NewsAgentOrchestrator:
 
     def __init__(self):
         """初始化编排器"""
-        # 完整工作流（非流式模式）
-        self.workflow = build_news_workflow()
         # 前置处理工作流（流式模式）
         self.preprocessing_workflow = build_preprocessing_workflow()
 
+        # TTS服务初始化（单例模式，在启动时初始化）
+        self.tts_service = get_tts_service()
+        
+        # LLM配置初始化
+        self.llm_config = llm_config
+        self.thinking_config = config.get_thinking_config()
+        
         # TTS模型预热（方案B优化：降低首次请求延迟）
         self._tts_warmed_up = False
+        
+        self._start_tts_warmup()
 
-        logger.info("NewsAgentOrchestrator 初始化完成")
+        logger.info(
+            f"NewsAgentOrchestrator 初始化完成: "
+            f"TTS服务={self.tts_service}, "
+            f"LLM模型={self.llm_config.get('model', 'unknown')}, "
+            f"thinking_enabled={self.thinking_config.get('enable_thinking', False)}"
+        )
+    
+    def _start_tts_warmup(self):
+        """
+        启动TTS预热任务（如果事件循环存在）
+        
+        如果事件循环存在，创建后台任务进行预热
+        """
+        if self._tts_warmed_up:
+            return
+        
+        try:
+            # 尝试获取当前事件循环
+            loop = asyncio.get_running_loop()
+            # 如果成功获取到事件循环，创建后台任务
+            loop.create_task(self._warmup_tts_if_needed())
+            logger.info("✅ TTS预热任务已在后台启动")
+        except RuntimeError:
+            # 没有运行中的事件循环，跳过预热（不会在首次请求时预热）
+            logger.info("ℹ️ 当前无事件循环，跳过TTS预热")
+        except Exception as e:
+            logger.warning(f"⚠️ 启动TTS预热任务失败: {e}")
 
     async def _warmup_tts_if_needed(self):
         """如果需要，预热TTS模型（方案B优化）"""
@@ -51,8 +89,8 @@ class NewsAgentOrchestrator:
             return
 
         try:
-            from tts_utils import get_tts_service
-            tts_service = get_tts_service()
+            # 使用已初始化的TTS服务
+            tts_service = self.tts_service
 
             if not tts_service or not tts_service.enabled:
                 logger.info("TTS服务未启用，跳过预热")
@@ -65,8 +103,7 @@ class NewsAgentOrchestrator:
             start_time = time.time()
 
             async def dummy_text_stream():
-                """简单的文本流用于预热"""
-                yield "你好"
+                yield "你好，这是预热TTS的文本"
 
             # 尝试进行一次TTS合成来预热模型
             async def do_warmup():
@@ -86,9 +123,6 @@ class NewsAgentOrchestrator:
             logger.info(f"✅ TTS模型预热完成，耗时: {elapsed:.2f}秒")
             self._tts_warmed_up = True
 
-        except asyncio.TimeoutError:
-            logger.warning(f"⚠️ TTS模型预热超时（{warmup_timeout}秒），将在首次请求时初始化")
-            self._tts_warmed_up = True  # 标记为已尝试，避免重复
         except Exception as e:
             logger.warning(f"⚠️ TTS模型预热失败: {e}，将在首次请求时初始化")
             self._tts_warmed_up = True  # 标记为已尝试，避免重复
@@ -111,9 +145,6 @@ class NewsAgentOrchestrator:
             SSE格式的响应数据
         """
         logger.info(f"处理查询: query={query}, request_id={request_id}, stream={stream}")
-
-        # 方案B优化：预热TTS模型（首次调用时）
-        await self._warmup_tts_if_needed()
 
         # 构建初始状态
         initial_state: NewsAgentState = {
@@ -157,18 +188,10 @@ class NewsAgentOrchestrator:
             "completed": False
         }
 
-        # 记录请求开始时间
-        request_start_time = time.time()
-        
         try:
-            if stream:
-                # 流式模式：使用混合架构
-                async for response in self._process_stream(initial_state, request_id):
-                    yield response
-            else:
-                # 非流式模式：使用完整工作流
-                final_state = await self.workflow.ainvoke(initial_state)
-                yield ResponseBuilder.build_final_response(final_state, request_id, request_start_time)
+            # 流式模式：使用混合架构
+            async for response in self._process_stream(initial_state, request_id):
+                yield response
 
         except Exception as e:
             logger.error(f"处理查询失败: {e}", exc_info=True)
@@ -195,12 +218,11 @@ class NewsAgentOrchestrator:
         Yields:
             SSE格式的响应数据
         """
-        # 记录请求开始时间（用于计算总耗时）
         request_start_time = time.time()
         frame_id = 0
         
         # 用于跟踪流式生成的音频块（用于debug info）
-        streaming_audio_chunks_tracker = []
+        total_audo_chunks = []
         
         # ==================== 第一阶段：前置处理（LangGraph） ====================
         logger.info("=== 阶段1：前置处理（LangGraph ainvoke）===")
@@ -224,40 +246,13 @@ class NewsAgentOrchestrator:
             logger.info(f"前置处理完成: selected_news={len(selected_news)}, tts_language={tts_language}, image_links={len(image_links)}")
             
             if not selected_news:
+                # todo 这里需要优化，应该返回一个更友好的错误信息
                 yield ResponseBuilder.build_error_response("未找到相关新闻", request_id)
                 return
             
-            # ==================== 优化：提前并行准备LLM和TTS资源 ====================
-            # 在发送图片帧的同时，并行执行以下准备工作，减少后续延迟
-            from llm_utils.llm_service import LLMService, llm_config
-            from llm_utils.config import config
-            from core.constants import LLM_CONFIG
-            from tts_utils import get_tts_service
+            # 使用已初始化的TTS服务
+            tts_service = self.tts_service
             
-            # TTS服务已在应用启动时初始化（单例模式），直接获取实例即可
-            # 不需要异步包装，因为get_tts_service()是同步的且已经初始化
-            tts_service = get_tts_service()
-            
-            # 并行执行LLM资源准备任务
-            async def prepare_llm_resources():
-                """准备LLM相关资源（配置、messages）"""
-                try:
-                    thinking_config = config.get_thinking_config()
-                    messages = build_news_summary_messages(selected_news, target_language=tts_language)
-                    model_name = llm_config['model']
-                    return {
-                        "thinking_config": thinking_config,
-                        "messages": messages,
-                        "model_name": model_name
-                    }
-                except Exception as e:
-                    logger.error(f"准备LLM资源失败: {e}", exc_info=True)
-                    return None
-            
-            # 启动LLM资源准备任务
-            llm_prep_task = asyncio.create_task(prepare_llm_resources())
-            
-            # 立即发送图片帧（不等待准备任务完成）
             if image_links:
                 frame_id += 1
                 yield ResponseBuilder.build_image_frame(
@@ -266,20 +261,13 @@ class NewsAgentOrchestrator:
                     request_id=request_id
                 )
                 logger.info(f"已发送图片帧: {len(image_links)} 张图片")
-            
-            # 等待LLM资源准备任务完成（此时图片帧已经发送）
-            llm_prep_result = await llm_prep_task
-            
-            if llm_prep_result is None:
-                yield ResponseBuilder.build_error_response("准备LLM资源失败", request_id)
-                return
-            
-            thinking_config = llm_prep_result["thinking_config"]
-            messages = llm_prep_result["messages"]
-            model_name = llm_prep_result["model_name"]
+
+            # 使用已初始化的配置
+            thinking_config = self.thinking_config
+            model_name = self.llm_config['model']
             enable_thinking = thinking_config["enable_thinking"]
-            
-            logger.info(f"✅ 并行准备完成: TTS服务已就绪（启动时已初始化）, messages已构建, model={model_name}")
+            messages = build_news_summary_messages(selected_news, target_language=tts_language)
+            # logger.info(f"✅ 并行准备完成: TTS服务已就绪（启动时已初始化）, messages已构建, model={model_name}")
                 
         except Exception as e:
             logger.error(f"前置处理失败: {e}", exc_info=True)
@@ -287,7 +275,7 @@ class NewsAgentOrchestrator:
             return
         
         # ==================== 第二阶段：流式生成（手动处理） ====================
-        logger.info("=== 阶段2：流式生成（手动处理）===")
+        # logger.info("=== 阶段2：流式生成（手动处理）===")
 
         logger.info(f"开始流式生成: model={model_name}, enable_thinking={enable_thinking}")
         
@@ -298,36 +286,23 @@ class NewsAgentOrchestrator:
         in_thinking_phase = True
         thinking_content = ""
         
-        # 保存图片链接供最终帧使用
-        final_image_links = image_links
-        
         # 流式TTS集成：创建文本流生成器和队列
         # 优化：添加背压控制，防止队列堆积
-        from tts_utils.tts_optimization_utils import BackpressureController
-        
         text_stream_queue: asyncio.Queue = asyncio.Queue(maxsize=200)  # 增大队列容量
         audio_queue: asyncio.Queue = asyncio.Queue(maxsize=50)  # 音频队列
         text_stream_done = False  # 标记文本流是否结束
         audio_stream_done = False  # 标记音频流是否结束
         
-        # 优化：创建背压控制器
+        # 优化：创建背压控制器（BackpressureController已在顶部导入）
         text_backpressure = BackpressureController(text_stream_queue, threshold=0.8)
-        audio_backpressure = BackpressureController(audio_queue, threshold=0.8)
         
-        # TTS服务已在准备阶段初始化（优化：提前初始化）
-        logger.info(f"TTS服务: service={tts_service}, enabled={getattr(tts_service, 'enabled', 'unknown') if tts_service else 'None'}, mock_mode={getattr(tts_service, 'mock_mode', 'unknown') if tts_service else 'None'}")
+        # TTS服务已在__init__中初始化
+        logger.info(f"TTS服务: service={tts_service}, enabled={getattr(tts_service, 'enabled', 'unknown') if tts_service else 'None'}, mock_mode={getattr(tts_service, 'mock_mode', 'False') if tts_service else 'None'}")
         
         async def text_stream_generator():
             """
             将队列中的文本token转换为流式生成器
-            
-            优化：
-            1. 消除双重缓冲 - 直接传递token
-            2. 动态超时调整 - 根据数据流自适应调整超时
             """
-            from tts_utils.tts_optimization_utils import AdaptiveTimeout
-            
-            # 优化：使用自适应超时
             adaptive_timeout = AdaptiveTimeout(
                 initial=0.1,
                 min_timeout=0.001,
@@ -336,7 +311,6 @@ class NewsAgentOrchestrator:
             
             while True:
                 try:
-                    # 检查是否已完成且队列为空
                     if text_stream_done and text_stream_queue.empty():
                         break
                     
@@ -371,7 +345,6 @@ class NewsAgentOrchestrator:
                     logger.error(f"文本流生成器错误: {e}", exc_info=True)
                     break
         
-        # 启动流式TTS合成任务
         tts_task = None
         try:
             logger.info(f"准备启动流式TTS任务: request_id={request_id}, language={tts_language}, service={tts_service}")
@@ -429,6 +402,29 @@ class NewsAgentOrchestrator:
         if tts_service:
             audio_monitor_task_handle = asyncio.create_task(audio_monitor_task())
         
+        # 辅助函数：处理并yield音频块列表
+        async def process_and_yield_audio_chunks(chunks_list):
+            """
+            处理并yield音频块列表
+            
+            Args:
+                chunks_list: 音频块列表（会被修改，从中pop元素）
+            
+            Yields:
+                SSE格式的音频帧响应
+            """
+            while chunks_list:
+                audio_chunk_data = chunks_list.pop(0)
+                frame_id += 1
+                total_audo_chunks.append(audio_chunk_data)
+                yield ResponseBuilder.build_audio_token_frame(
+                    frame_id=frame_id,
+                    audio_chunk=audio_chunk_data,
+                    is_final=False,
+                    request_id=request_id
+                )
+                logger.debug(f"✅ 音频块已yield: frame_id={frame_id}, request_id={request_id}")
+        
         try:
             # 流式调用 LLM
             async for token_type, token_content in LLMService.call_llm_stream(
@@ -439,17 +435,8 @@ class NewsAgentOrchestrator:
                 enable_thinking=enable_thinking
             ):
                 # 在每次LLM token到来时，先yield所有待处理的音频块
-                while pending_audio_chunks:
-                    audio_chunk_data = pending_audio_chunks.pop(0)
-                    frame_id += 1
-                    streaming_audio_chunks_tracker.append(audio_chunk_data)  # 记录音频块
-                    yield ResponseBuilder.build_audio_token_frame(
-                        frame_id=frame_id,
-                        audio_chunk=audio_chunk_data,
-                        is_final=False,
-                        request_id=request_id
-                    )
-                    logger.debug(f"✅ 音频块已yield: frame_id={frame_id}, request_id={request_id}")
+                async for audio_frame in process_and_yield_audio_chunks(pending_audio_chunks):
+                    yield audio_frame
                 
                 # 清空事件标志
                 audio_ready_event.clear()
@@ -492,17 +479,8 @@ class NewsAgentOrchestrator:
                     # 优化：统一音频处理逻辑，避免重复代码
                     # 在yield文本后，立即检查并处理所有待处理的音频块
                     if pending_audio_chunks or audio_ready_event.is_set():
-                        while pending_audio_chunks:
-                            audio_chunk_data = pending_audio_chunks.pop(0)
-                            frame_id += 1
-                            streaming_audio_chunks_tracker.append(audio_chunk_data)  # 记录音频块
-                            yield ResponseBuilder.build_audio_token_frame(
-                                frame_id=frame_id,
-                                audio_chunk=audio_chunk_data,
-                                is_final=False,
-                                request_id=request_id
-                            )
-                            logger.debug(f"✅ 文本后音频块已yield: frame_id={frame_id}, request_id={request_id}")
+                        async for audio_frame in process_and_yield_audio_chunks(pending_audio_chunks):
+                            yield audio_frame
                         audio_ready_event.clear()
             
             # LLM 生成完成，发送结束信号给TTS流
@@ -558,25 +536,19 @@ class NewsAgentOrchestrator:
             
             # 输出所有剩余的待处理音频chunk（优化：简化，只有一个pending列表）
             remaining_audio_count = 0
-            while pending_audio_chunks:
-                audio_chunk_data = pending_audio_chunks.pop(0)
-                frame_id += 1
+            
+            # 处理pending列表中的音频块
+            async for audio_frame in process_and_yield_audio_chunks(pending_audio_chunks):
                 remaining_audio_count += 1
-                streaming_audio_chunks_tracker.append(audio_chunk_data)  # 记录音频块
-                yield ResponseBuilder.build_audio_token_frame(
-                    frame_id=frame_id,
-                    audio_chunk=audio_chunk_data,
-                    is_final=False,
-                    request_id=request_id
-                )
+                yield audio_frame
             
             # 也检查原始音频队列（以防有遗漏）
             while not audio_queue.empty():
                 try:
                     audio_chunk_data = audio_queue.get_nowait()
-                    frame_id += 1
                     remaining_audio_count += 1
-                    streaming_audio_chunks_tracker.append(audio_chunk_data)  # 记录音频块
+                    frame_id += 1
+                    total_audo_chunks.append(audio_chunk_data)
                     yield ResponseBuilder.build_audio_token_frame(
                         frame_id=frame_id,
                         audio_chunk=audio_chunk_data,
@@ -590,7 +562,7 @@ class NewsAgentOrchestrator:
                 logger.info(f"✅ 输出剩余 {remaining_audio_count} 个音频块: request_id={request_id}")
             
             # 记录音频块统计信息
-            total_audio_chunks = len(streaming_audio_chunks_tracker)
+            total_audio_chunks = len(total_audo_chunks)
             logger.info(f"📊 音频块统计: 已记录 {total_audio_chunks} 个音频块到tracker, request_id={request_id}")
             
             # 构建最终状态（用于提取debug_info）
@@ -600,7 +572,7 @@ class NewsAgentOrchestrator:
                 "summary": content_buffer,
                 "thinking_chain": [],  # thinking_content已经在extension中
                 "streaming_text": content_buffer,
-                "streaming_audio_chunks": streaming_audio_chunks_tracker,  # 添加音频块追踪
+                "streaming_audio_chunks": total_audo_chunks,  # 添加音频块追踪
                 "tts_language": tts_language,  # 确保包含TTS语言
                 "language_confidence": preprocessing_state.get("language_confidence", 0.9),  # 确保包含语言置信度
                 "completed": True
@@ -620,7 +592,7 @@ class NewsAgentOrchestrator:
                 frame_id=frame_id,
                 full_text=content_buffer,
                 thinking_content=thinking_content,
-                image_links=final_image_links,
+                image_links=image_links,
                 request_id=request_id,
                 debug_info=debug_info
             )
