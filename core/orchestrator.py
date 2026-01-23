@@ -565,47 +565,13 @@ class NewsAgentOrchestrator:
             thinking_started = False
             thinking_ended = False  # 标记thinking是否已结束
 
-            async def flush_content(force=False, thinking_just_ended=False):
+            async def flush_content(force=False):
                 """刷新content文本到TTS队列（智能分割）"""
                 nonlocal content_buf, last_content_ts
                 if not content_buf:
                     return
                 
                 now = time.time()
-                
-                # 优化：如果thinking刚结束，降低flush阈值，让text更快开始输出
-                if thinking_just_ended:
-                    # thinking结束后，如果content达到较小阈值（5个字符），立即flush
-                    # 这样可以避免用户感觉卡住
-                    min_threshold = max(5, tts_min_length // 3)  # 至少5个字符，或最小长度的1/3
-                    if len(content_buf) >= min_threshold:
-                        # 尝试在标点处分割，如果没有标点，也允许分割
-                        boundary_pos = _find_sentence_boundary(content_buf)
-                        if boundary_pos != -1 and boundary_pos >= min_threshold:
-                            # 找到句子边界，在边界处分割
-                            chunk = content_buf[:boundary_pos + 1].strip()
-                            content_buf = content_buf[boundary_pos + 1:].strip()
-                        elif len(content_buf) >= min_threshold * 2:
-                            # 没有找到句子边界，但内容足够长，在中间分割
-                            split_pos = len(content_buf) // 2
-                            # 尝试在附近找标点
-                            for punct in SAFE_SPLIT_PUNCTUATION:
-                                pos = content_buf.rfind(punct, max(0, split_pos - 10), split_pos + 10)
-                                if pos != -1:
-                                    split_pos = pos + 1
-                                    break
-                            chunk = content_buf[:split_pos].strip()
-                            content_buf = content_buf[split_pos:].strip()
-                        else:
-                            # 内容还不够长，等待更多内容
-                            return
-                        
-                        last_content_ts = now
-                        await text_frame_queue.put(("text", chunk))
-                        await tts_queue.put(chunk)
-                        logger.debug(f"[TTS_INPUT] request_id={request_id}, len={len(chunk)}, preview={chunk[:60]} (thinking刚结束，快速flush)")
-                        return
-                
                 if not force and not _should_flush_text(content_buf, last_content_ts, now):
                     return
                 
@@ -698,13 +664,12 @@ class NewsAgentOrchestrator:
                             
                             content_buf += token_content
                             # 统一调用flush_content，传入thinking_just_ended参数
-                            await flush_content(thinking_just_ended=thinking_just_ended)
+                            await flush_content()
             except Exception as e:
                 logger.error(f"LLM消费失败: {e}", exc_info=True)
                 await text_frame_queue.put(("error", str(e)))
             finally:
                 # 强制刷新剩余内容
-                await flush_thinking(force=True)
                 await flush_content(force=True)
                 await text_frame_queue.put(("done", None))
                 await tts_queue.put(None)  # 发送结束信号
@@ -824,7 +789,7 @@ class NewsAgentOrchestrator:
                             thinking_text += chunk
                             last_thinking_chunk = chunk  # 记录最后一个thinking chunk
                             frame_id += 1
-                            logger.info(f"current return FRAME: {frame_id}")
+                            # logger.debug(f"d: {frame_id}")
                             yield ResponseBuilder.build_thinking_token_frame(
                                 frame_id=frame_id, thinking_token=chunk,
                                 request_id=request_id, version=version
@@ -864,7 +829,7 @@ class NewsAgentOrchestrator:
             if last_thinking_chunk and not last_thinking_chunk.rstrip().endswith("</think>"):
                 # 最后一个thinking chunk没有关闭标签，需要添加
                 frame_id += 1
-                logger.info(f"current return FRAME: {frame_id} (closing thinking tag)")
+                # logger.debug(f"d: {frame_id} (closing thinking tag)")
                 thinking_text += "</think>"
                 yield ResponseBuilder.build_thinking_token_frame(
                     frame_id=frame_id, thinking_token="</think>",
@@ -886,7 +851,7 @@ class NewsAgentOrchestrator:
                         elif kind == "text":
                             full_text += chunk
                             frame_id += 1
-                            logger.info(f"current return FRAME: {frame_id}")
+                            # logger.debug(f"d: {frame_id}")
                             yield ResponseBuilder.build_text_token_frame(
                                 frame_id=frame_id, text_token=chunk,
                                 request_id=request_id, version=version
@@ -904,7 +869,7 @@ class NewsAgentOrchestrator:
                         else:
                             audio_chunk, audio_is_final = audio_item, False
                         frame_id += 1
-                        logger.info(f"current return FRAME: {frame_id}")
+                        # logger.debug(f"d: {frame_id}")
                         total_audio_chunks.append(audio_chunk)
                         yield ResponseBuilder.build_audio_token_frame(
                             frame_id=frame_id, audio_chunk=audio_chunk,
@@ -929,7 +894,7 @@ class NewsAgentOrchestrator:
                     else:
                         audio_chunk, audio_is_final = audio_item, False
                     frame_id += 1
-                    logger.info(f"current return FRAME: {frame_id}")
+                    # logger.debug(f"d: {frame_id}")
                     total_audio_chunks.append(audio_chunk)
                     yield ResponseBuilder.build_audio_token_frame(
                         frame_id=frame_id, audio_chunk=audio_chunk,
@@ -982,7 +947,7 @@ class NewsAgentOrchestrator:
             )
 
             frame_id += 1
-            logger.info(f"current return FRAME: {frame_id}")
+            # logger.debug(f"d: {frame_id}")
             yield ResponseBuilder.build_final_stream_frame(
                 frame_id=frame_id, full_text=full_text, thinking_content=thinking_text,
                 request_id=request_id, debug_info=debug_info if debug else None, version=version

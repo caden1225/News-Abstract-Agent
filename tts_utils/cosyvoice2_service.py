@@ -9,10 +9,9 @@ import asyncio
 import base64
 import time
 import uuid as uuid_module
-from typing import AsyncGenerator, Optional, List, Dict, Tuple, Tuple
+from typing import AsyncGenerator, Optional, List, Dict
 from threading import Lock
 from pathlib import Path
-from collections import deque
 
 # 添加CosyVoice2模块到路径
 # 优先使用项目内的 CosyVoice2_IN 目录
@@ -112,11 +111,6 @@ class CosyVoice2TTS:
         self._session_lock = Lock()
         self._sessions: Dict[str, Dict] = {}  # request_id -> {uuid, chunk_count, created_at}
         self._session_timeout = 300  # session 超时时间（秒）
-        
-        # 方案C：队列机制 - 为每个 request_id 维护文本队列和处理任务
-        self._text_queues: Dict[str, asyncio.Queue] = {}  # request_id -> Queue[Tuple[text, is_last, future]]
-        self._processing_tasks: Dict[str, asyncio.Task] = {}  # request_id -> Task
-        self._queue_lock = asyncio.Lock()  # 异步锁，用于保护队列字典
 
         self._initialized = True
 
@@ -178,169 +172,6 @@ class CosyVoice2TTS:
                     del self._sessions[request_id]
                     logger.debug(f"释放 session: request_id={request_id}")
                 # 否则保留 session 供后续 chunk 使用
-
-    async def _process_text_queue(self, request_id: str, spk_id: str):
-        """
-        方案C：后台处理任务 - 从队列读取所有文本chunk，合并后一次性调用 inference_sft_chunked
-        
-        Args:
-            request_id: 请求ID
-            spk_id: 说话人ID
-        """
-        if not self._model_loaded:
-            self.load_model()
-        
-        # 获取或创建 session UUID
-        session_uuid = self._get_or_create_session(request_id)
-        
-        try:
-            # 累积所有文本 chunk
-            text_chunks = []
-            futures = []  # 存储每个 chunk 对应的 Future
-            
-            logger.info(f"[方案C] 开始处理队列: request_id={request_id}, session_uuid={session_uuid}")
-            
-            # 从队列读取所有 chunk
-            while True:
-                item = await self._text_queues[request_id].get()
-                if item is None:  # 结束信号（如果最后一个chunk已经处理，这里会收到None）
-                    logger.debug(f"[方案C] 收到结束信号，已累积 {len(text_chunks)} 个chunks")
-                    break
-                
-                text, is_last, future = item
-                text_chunks.append(text)
-                futures.append(future)
-                
-                logger.debug(f"[方案C] 收到 chunk {len(text_chunks)}: {len(text)} 字符, is_last={is_last}")
-                
-                if is_last:
-                    # 收到最后一个chunk，开始处理
-                    logger.debug(f"[方案C] 收到最后一个chunk，开始处理 {len(text_chunks)} 个chunks")
-                    break
-            
-            if not text_chunks:
-                logger.warning(f"[方案C] 没有文本需要处理: request_id={request_id}")
-                # 设置所有 Future 为空结果
-                for future in futures:
-                    if not future.done():
-                        future.set_result(b"")
-                return
-            
-            logger.info(f"[方案C] 开始合并合成: {len(text_chunks)} 个chunks, 总长度={sum(len(t) for t in text_chunks)} 字符")
-            
-            # 一次性调用 inference_sft_chunked，合并所有 chunk
-            loop = asyncio.get_event_loop()
-            
-            def run_synthesis():
-                audio_chunks = []
-                # 使用 inference_sft_chunked 方法，将所有 chunk 合并处理
-                # 这样所有 chunk 共享同一个 UUID 和 KV-cache，保证音色一致性
-                for result in self.model.inference_sft_chunked(
-                    text_chunks=text_chunks,  # 所有 chunk 合并传入
-                    spk_id=spk_id,
-                    stream=False,  # 非流式模式，一次性返回完整音频
-                    speed=1.0,
-                    text_frontend=True
-                ):
-                    audio = result["tts_speech"]
-                    if isinstance(audio, torch.Tensor):
-                        audio = audio.squeeze().cpu().numpy()
-                    
-                    if audio.dtype == np.float32 or audio.dtype == np.float64:
-                        audio = (audio * 32767).astype(np.int16)
-                    
-                    audio_chunks.append(audio)
-                
-                return b"".join(chunk.tobytes() for chunk in audio_chunks)
-            
-            # 在线程池中执行合成
-            merged_audio = await loop.run_in_executor(None, run_synthesis)
-            
-            logger.info(f"[方案C] 合并合成完成: {len(merged_audio)} 字节, {len(merged_audio)/2/self.sample_rate:.2f}秒")
-            
-            # 将合并后的音频按文本长度比例分割
-            # 计算每个 chunk 的文本长度比例
-            chunk_count = len(text_chunks)
-            if chunk_count > 0 and len(futures) == chunk_count:
-                total_text_len = sum(len(t) for t in text_chunks)
-                if total_text_len > 0:
-                    # 按文本长度比例分割音频
-                    # 16-bit PCM = 2 bytes per sample，确保分割位置是2的倍数
-                    current_pos = 0
-                    for i, (text_chunk, future) in enumerate(zip(text_chunks, futures)):
-                        # 计算这个 chunk 的文本长度比例
-                        text_ratio = len(text_chunk) / total_text_len
-                        # 计算对应的音频长度（字节，16-bit PCM = 2 bytes per sample）
-                        chunk_audio_bytes = int(len(merged_audio) * text_ratio)
-                        # 确保分割位置是2的倍数（16-bit对齐）
-                        chunk_audio_bytes = (chunk_audio_bytes // 2) * 2
-                        
-                        # 确保最后一个 chunk 包含所有剩余音频
-                        if i == chunk_count - 1:
-                            chunk_audio = merged_audio[current_pos:]
-                        else:
-                            chunk_audio = merged_audio[current_pos:current_pos + chunk_audio_bytes]
-                            current_pos += chunk_audio_bytes
-                        
-                        if not future.done():
-                            future.set_result(chunk_audio)
-                            logger.debug(f"[方案C] 设置 chunk {i+1} 音频: {len(chunk_audio)} 字节 (文本长度={len(text_chunk)}, 比例={text_ratio:.3f})")
-                else:
-                    # 文本长度为0，平均分割（确保2字节对齐）
-                    chunk_size = (len(merged_audio) // chunk_count // 2) * 2  # 对齐到2字节
-                    for i, future in enumerate(futures):
-                        if i < chunk_count - 1:
-                            chunk_audio = merged_audio[i * chunk_size:(i + 1) * chunk_size]
-                        else:
-                            chunk_audio = merged_audio[i * chunk_size:]
-                        if not future.done():
-                            future.set_result(chunk_audio)
-                            logger.debug(f"[方案C] 设置 chunk {i+1} 音频: {len(chunk_audio)} 字节 (平均分割)")
-            else:
-                logger.error(f"[方案C] chunks和futures数量不匹配: chunks={chunk_count}, futures={len(futures)}")
-                # 设置所有 Future 为异常
-                error = ValueError(f"chunks和futures数量不匹配: chunks={chunk_count}, futures={len(futures)}")
-                for future in futures:
-                    if not future.done():
-                        future.set_exception(error)
-            
-            # 释放 session
-            self._release_session(request_id, is_final=True)
-            
-        except Exception as e:
-            logger.error(f"[方案C] 处理队列失败: request_id={request_id}, error={e}", exc_info=True)
-            # 设置所有 Future 为异常（如果futures列表已初始化）
-            if 'futures' in locals() and futures:
-                for future in futures:
-                    if not future.done():
-                        future.set_exception(e)
-            else:
-                # 如果异常发生在futures初始化之前，需要从队列中获取所有future
-                logger.warning(f"[方案C] 异常发生在futures初始化之前，尝试从队列获取所有future")
-                try:
-                    # 使用异步方式清理队列
-                    while True:
-                        try:
-                            item = await asyncio.wait_for(self._text_queues[request_id].get(), timeout=0.1)
-                            if item is not None:
-                                _, _, future = item
-                                if not future.done():
-                                    future.set_exception(e)
-                        except asyncio.TimeoutError:
-                            # 队列为空，退出循环
-                            break
-                        except Exception as get_error:
-                            logger.error(f"[方案C] 从队列获取item时出错: {get_error}", exc_info=True)
-                            break
-                except Exception as cleanup_error:
-                    logger.error(f"[方案C] 清理队列时出错: {cleanup_error}", exc_info=True)
-        finally:
-            # 清理队列和任务
-            async with self._queue_lock:
-                if request_id in self._text_queues:
-                    del self._text_queues[request_id]
-                if request_id in self._processing_tasks:
-                    del self._processing_tasks[request_id]
 
     def load_model(self):
         """加载TTS模型（线程安全）"""
@@ -543,13 +374,13 @@ class CosyVoice2TTS:
         is_last_chunk: bool = False
     ) -> bytes:
         """
-        非流式语音合成（方案C：使用队列机制，累积所有chunk后一次性处理）
+        非流式语音合成（使用inference_sft_chunked方法，保持语义连贯性）
         
         Args:
             text: 待合成文本
             spk_id: 说话人ID（可选，默认使用配置的ID）
             request_id: 请求ID，用于跨 chunk 的 session 管理，保证音色一致性
-            is_last_chunk: 是否为最后一个 chunk，用于触发处理
+            is_last_chunk: 是否为最后一个 chunk，用于决定是否清理 session
         
         Returns:
             PCM音频数据
@@ -559,62 +390,69 @@ class CosyVoice2TTS:
 
         spk_id = spk_id or self.spk_id
 
-        # 方案C：如果 request_id 为 None，使用原来的方式（单次处理）
-        if request_id is None:
-            logger.info(f"[方案C] request_id=None，使用单次处理模式: {len(text)} 字符")
-            loop = asyncio.get_event_loop()
-            
-            def run_synthesis():
-                audio_chunks = []
-                for result in self.model.inference_sft_chunked(
-                    text_chunks=[text],
-                    spk_id=spk_id,
-                    stream=False,
-                    speed=1.0,
-                    text_frontend=True
-                ):
-                    audio = result["tts_speech"]
-                    if isinstance(audio, torch.Tensor):
-                        audio = audio.squeeze().cpu().numpy()
-                    if audio.dtype == np.float32 or audio.dtype == np.float64:
-                        audio = (audio * 32767).astype(np.int16)
-                    audio_chunks.append(audio)
-                return b"".join(chunk.tobytes() for chunk in audio_chunks)
-            
-            audio_data = await loop.run_in_executor(None, run_synthesis)
-            logger.info(f"合成完成: {len(audio_data)} 字节, {len(audio_data)/2/self.sample_rate:.2f}秒")
-            return audio_data
+        # 获取或创建 session UUID
+        session_uuid = self._get_or_create_session(request_id)
+        reuse_cache = session_uuid is not None and self._sessions.get(request_id, {}).get('chunk_count', 0) > 0
 
-        # 方案C：使用队列机制
-        # 第一步：在锁内创建队列、放入文本、启动任务
-        async with self._queue_lock:
-            # 获取或创建队列
-            if request_id not in self._text_queues:
-                self._text_queues[request_id] = asyncio.Queue()
-                logger.debug(f"[方案C] 创建新队列: request_id={request_id}")
+        logger.info(f"开始合成: {len(text)} 字符, request_id={request_id}, session_uuid={session_uuid}, reuse_cache={reuse_cache}")
+
+        loop = asyncio.get_event_loop()
+
+        def run_synthesis():
+            audio_chunks = []
+            # 使用inference_sft_chunked方法，即使只有一个文本chunk也能保持语义连贯性
+            # stream=False 表示非流式输出，一次性返回完整音频
+            # 传递自定义 UUID 和 reuse_cache 参数，实现跨 chunk 的缓存复用
+            inference_kwargs = {}
+            if session_uuid is not None:
+                inference_kwargs['custom_uuid'] = session_uuid
+                inference_kwargs['reuse_cache'] = reuse_cache
+                inference_kwargs['is_final'] = is_last_chunk
             
-            # 创建 Future 用于返回结果
-            future = asyncio.Future()
+            # for result in self.model.inference_sft_chunked(
+            #     text_chunks=[text],  # 将单个文本作为chunk列表传入
+            #     spk_id=spk_id,
+            #     stream=False,  # 非流式模式
+            #     speed=1.0,
+            #     text_frontend=True,
+            #     **inference_kwargs
+            # ):
+            #     audio = result["tts_speech"]
+            #     if isinstance(audio, torch.Tensor):
+            #         audio = audio.squeeze().cpu().numpy()
+
+            #     if audio.dtype == np.float32 or audio.dtype == np.float64:
+            #         audio = (audio * 32767).astype(np.int16)
+
+            #     audio_chunks.append(audio)
+
+            result = next(self.model.inference_sft(
+                tts_text=text,
+                spk_id=spk_id,
+                stream=False,
+                speed=1.0,
+                text_frontend=True,
+                # **inference_kwargs
+            ))
+            audio = result["tts_speech"]
+            if isinstance(audio, torch.Tensor):
+                audio = audio.squeeze().cpu().numpy()
             
-            # 将文本放入队列
-            await self._text_queues[request_id].put((text, is_last_chunk, future))
-            logger.debug(f"[方案C] 文本入队: request_id={request_id}, len={len(text)}, is_last={is_last_chunk}")
+            # 将 float32/float64 音频数据转换为 int16 格式（PCM 标准格式）
+            if audio.dtype == np.float32 or audio.dtype == np.float64:
+                audio = (audio * 32767).astype(np.int16)
             
-            # 如果是第一个chunk，启动处理任务（后台持续运行）
-            if request_id not in self._processing_tasks:
-                task = asyncio.create_task(self._process_text_queue(request_id, spk_id))
-                self._processing_tasks[request_id] = task
-                logger.debug(f"[方案C] 启动处理任务: request_id={request_id}")
-        
-        # 第二步：释放锁后等待结果（避免死锁）
-        # 注意：处理任务会在收到 is_last=True 的chunk后自动开始处理，不需要发送额外的结束信号
-        try:
-            audio_data = await future
-            logger.info(f"[方案C] 合成完成: {len(audio_data)} 字节, {len(audio_data)/2/self.sample_rate:.2f}秒")
-            return audio_data
-        except Exception as e:
-            logger.error(f"[方案C] 等待结果失败: request_id={request_id}, error={e}", exc_info=True)
-            raise
+            audio_chunks = [audio]
+            return b"".join(chunk.tobytes() for chunk in audio_chunks)
+
+        audio_data = await loop.run_in_executor(None, run_synthesis)
+
+        # 释放 session（如果是最后一个 chunk）
+        self._release_session(request_id, is_final=is_last_chunk)
+
+        logger.info(f"合成完成: {len(audio_data)} 字节, {len(audio_data)/2/self.sample_rate:.2f}秒")
+
+        return audio_data
 
 
 # 全局TTS服务实例
