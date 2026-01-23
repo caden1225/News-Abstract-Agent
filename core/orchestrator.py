@@ -563,14 +563,49 @@ class NewsAgentOrchestrator:
             last_content_ts = time.time()
             last_thinking_ts = time.time()
             thinking_started = False
+            thinking_ended = False  # 标记thinking是否已结束
 
-            async def flush_content(force=False):
+            async def flush_content(force=False, thinking_just_ended=False):
                 """刷新content文本到TTS队列（智能分割）"""
                 nonlocal content_buf, last_content_ts
                 if not content_buf:
                     return
                 
                 now = time.time()
+                
+                # 优化：如果thinking刚结束，降低flush阈值，让text更快开始输出
+                if thinking_just_ended:
+                    # thinking结束后，如果content达到较小阈值（5个字符），立即flush
+                    # 这样可以避免用户感觉卡住
+                    min_threshold = max(5, tts_min_length // 3)  # 至少5个字符，或最小长度的1/3
+                    if len(content_buf) >= min_threshold:
+                        # 尝试在标点处分割，如果没有标点，也允许分割
+                        boundary_pos = _find_sentence_boundary(content_buf)
+                        if boundary_pos != -1 and boundary_pos >= min_threshold:
+                            # 找到句子边界，在边界处分割
+                            chunk = content_buf[:boundary_pos + 1].strip()
+                            content_buf = content_buf[boundary_pos + 1:].strip()
+                        elif len(content_buf) >= min_threshold * 2:
+                            # 没有找到句子边界，但内容足够长，在中间分割
+                            split_pos = len(content_buf) // 2
+                            # 尝试在附近找标点
+                            for punct in SAFE_SPLIT_PUNCTUATION:
+                                pos = content_buf.rfind(punct, max(0, split_pos - 10), split_pos + 10)
+                                if pos != -1:
+                                    split_pos = pos + 1
+                                    break
+                            chunk = content_buf[:split_pos].strip()
+                            content_buf = content_buf[split_pos:].strip()
+                        else:
+                            # 内容还不够长，等待更多内容
+                            return
+                        
+                        last_content_ts = now
+                        await text_frame_queue.put(("text", chunk))
+                        await tts_queue.put(chunk)
+                        logger.debug(f"[TTS_INPUT] request_id={request_id}, len={len(chunk)}, preview={chunk[:60]} (thinking刚结束，快速flush)")
+                        return
+                
                 if not force and not _should_flush_text(content_buf, last_content_ts, now):
                     return
                 
@@ -589,7 +624,7 @@ class NewsAgentOrchestrator:
 
             async def flush_thinking(force=False):
                 """刷新thinking文本，立即输出（不等待最小长度），不提交TTS"""
-                nonlocal thinking_buf, thinking_started, last_thinking_ts
+                nonlocal thinking_buf, thinking_started, last_thinking_ts, thinking_ended
                 if not thinking_buf:
                     return
                 
@@ -614,6 +649,10 @@ class NewsAgentOrchestrator:
                 else:
                     chunk = thinking_buf
                     thinking_buf = ""
+                
+                # 如果thinking_buf被清空且是force模式，说明thinking已结束
+                if force and not thinking_buf:
+                    thinking_ended = True
                 
                 last_thinking_ts = now
                 
@@ -648,8 +687,18 @@ class NewsAgentOrchestrator:
                             thinking_buf += token_content
                             await flush_thinking()  # thinking累积后输出
                         elif token_type == "content":
+                            # 检测thinking是否刚结束（从thinking切换到content）
+                            # 如果这是第一个content token且thinking_buf为空，说明thinking刚结束
+                            thinking_just_ended = False
+                            if not thinking_ended and thinking_buf == "" and not thinking_started:
+                                # thinking已结束，这是第一个content token
+                                thinking_ended = True
+                                thinking_just_ended = True
+                                logger.debug(f"[THINKING_ENDED] request_id={request_id}, 检测到thinking结束，开始处理content")
+                            
                             content_buf += token_content
-                            await flush_content()  # content累积后输出
+                            # 统一调用flush_content，传入thinking_just_ended参数
+                            await flush_content(thinking_just_ended=thinking_just_ended)
             except Exception as e:
                 logger.error(f"LLM消费失败: {e}", exc_info=True)
                 await text_frame_queue.put(("error", str(e)))
@@ -749,6 +798,7 @@ class NewsAgentOrchestrator:
             nonlocal frame_id, full_text, thinking_text
             text_finished = False
             thinking_phase_done = False  # thinking阶段是否完成
+            last_thinking_chunk = None  # 跟踪最后一个输出的thinking chunk
 
             # 第一阶段：完全排空所有thinking帧
             while not thinking_phase_done:
@@ -757,6 +807,7 @@ class NewsAgentOrchestrator:
                 # 检查并输出所有thinking帧
                 temp_items = []
                 has_thinking = False
+                has_non_thinking = False  # 标记是否有非thinking帧
                 
                 # 先取出队列中的所有项
                 while not text_frame_queue.empty():
@@ -771,6 +822,7 @@ class NewsAgentOrchestrator:
                         elif kind == "thinking":
                             has_thinking = True
                             thinking_text += chunk
+                            last_thinking_chunk = chunk  # 记录最后一个thinking chunk
                             frame_id += 1
                             logger.info(f"current return FRAME: {frame_id}")
                             yield ResponseBuilder.build_thinking_token_frame(
@@ -780,6 +832,7 @@ class NewsAgentOrchestrator:
                             emitted = True
                         else:
                             # 非thinking帧，暂存起来
+                            has_non_thinking = True
                             temp_items.append((kind, chunk))
                     except asyncio.QueueEmpty:
                         break
@@ -788,17 +841,35 @@ class NewsAgentOrchestrator:
                 for item in temp_items:
                     await text_frame_queue.put(item)
                 
+                # 关键修复：如果检测到非thinking帧（如text帧），说明thinking阶段已结束
+                # 应该立即退出第一阶段，进入第二阶段处理text和audio帧
+                if has_non_thinking:
+                    logger.info("检测到非thinking帧，thinking阶段结束，进入第二阶段")
+                    thinking_phase_done = True
+                    break
+                
                 # 如果没有thinking帧且文本生成已完成，thinking阶段结束
                 if not has_thinking:
                     if text_finished:
                         thinking_phase_done = True
                         break
-                    # 等待一下，看看是否有新的thinking帧
+                    # 等待一下，看看是否有新的thinking帧或非thinking帧
                     await asyncio.sleep(0.01)
                     # 如果文本生成已完成且队列为空，说明thinking阶段结束
                     if text_finished and text_frame_queue.empty():
                         thinking_phase_done = True
                         break
+
+            # 检查最后一个thinking帧是否已包含关闭标签，如果没有则添加
+            if last_thinking_chunk and not last_thinking_chunk.rstrip().endswith("</think>"):
+                # 最后一个thinking chunk没有关闭标签，需要添加
+                frame_id += 1
+                logger.info(f"current return FRAME: {frame_id} (closing thinking tag)")
+                thinking_text += "</think>"
+                yield ResponseBuilder.build_thinking_token_frame(
+                    frame_id=frame_id, thinking_token="</think>",
+                    request_id=request_id, version=version
+                )
 
             # 第二阶段：输出text和audio帧（交替输出）
             while True:
@@ -867,13 +938,6 @@ class NewsAgentOrchestrator:
                     )
                 except asyncio.QueueEmpty:
                     break
-
-            frame_id += 1
-            yield ResponseBuilder.build_final_stream_frame(
-                frame_id=frame_id, full_text=full_text, thinking_content=thinking_text,
-                request_id=request_id,
-                debug_info=build_debug_info_from_state(preprocessing_state, request_start_time)
-            )
 
         # 启动两个独立任务：文本生成和语音合成（无阻塞关系）
         text_task = asyncio.create_task(text_generator())
