@@ -563,7 +563,6 @@ class NewsAgentOrchestrator:
             last_content_ts = time.time()
             last_thinking_ts = time.time()
             thinking_started = False
-            thinking_ended = False  # 标记thinking是否已结束
 
             async def flush_content(force=False):
                 """刷新content文本到TTS队列（智能分割）"""
@@ -590,7 +589,7 @@ class NewsAgentOrchestrator:
 
             async def flush_thinking(force=False):
                 """刷新thinking文本，立即输出（不等待最小长度），不提交TTS"""
-                nonlocal thinking_buf, thinking_started, last_thinking_ts, thinking_ended
+                nonlocal thinking_buf, thinking_started, last_thinking_ts
                 if not thinking_buf:
                     return
                 
@@ -615,10 +614,6 @@ class NewsAgentOrchestrator:
                 else:
                     chunk = thinking_buf
                     thinking_buf = ""
-                
-                # 如果thinking_buf被清空且是force模式，说明thinking已结束
-                if force and not thinking_buf:
-                    thinking_ended = True
                 
                 last_thinking_ts = now
                 
@@ -653,23 +648,14 @@ class NewsAgentOrchestrator:
                             thinking_buf += token_content
                             await flush_thinking()  # thinking累积后输出
                         elif token_type == "content":
-                            # 检测thinking是否刚结束（从thinking切换到content）
-                            # 如果这是第一个content token且thinking_buf为空，说明thinking刚结束
-                            thinking_just_ended = False
-                            if not thinking_ended and thinking_buf == "" and not thinking_started:
-                                # thinking已结束，这是第一个content token
-                                thinking_ended = True
-                                thinking_just_ended = True
-                                logger.debug(f"[THINKING_ENDED] request_id={request_id}, 检测到thinking结束，开始处理content")
-                            
                             content_buf += token_content
-                            # 统一调用flush_content，传入thinking_just_ended参数
-                            await flush_content()
+                            await flush_content()  # content累积后输出
             except Exception as e:
                 logger.error(f"LLM消费失败: {e}", exc_info=True)
                 await text_frame_queue.put(("error", str(e)))
             finally:
                 # 强制刷新剩余内容
+                await flush_thinking(force=True)
                 await flush_content(force=True)
                 await text_frame_queue.put(("done", None))
                 await tts_queue.put(None)  # 发送结束信号
@@ -717,12 +703,8 @@ class NewsAgentOrchestrator:
                     except asyncio.QueueEmpty:
                         pending_chunk = None
                     
-                    # 调用TTS引擎，传递语言参数
-                    audio_bytes = await tts_service.synthesize(
-                        text=text_chunk, 
-                        spk_id=None,
-                        language=tts_language
-                    )
+                    # 调用TTS引擎
+                    audio_bytes = await tts_service.synthesize(text=text_chunk, spk_id=None)
                     
                     # 送入分块器进行8KB切割
                     new_chunks = chunker.add_audio(audio_bytes)
@@ -767,7 +749,6 @@ class NewsAgentOrchestrator:
             nonlocal frame_id, full_text, thinking_text
             text_finished = False
             thinking_phase_done = False  # thinking阶段是否完成
-            last_thinking_chunk = None  # 跟踪最后一个输出的thinking chunk
 
             # 第一阶段：完全排空所有thinking帧
             while not thinking_phase_done:
@@ -776,7 +757,6 @@ class NewsAgentOrchestrator:
                 # 检查并输出所有thinking帧
                 temp_items = []
                 has_thinking = False
-                has_non_thinking = False  # 标记是否有非thinking帧
                 
                 # 先取出队列中的所有项
                 while not text_frame_queue.empty():
@@ -791,9 +771,8 @@ class NewsAgentOrchestrator:
                         elif kind == "thinking":
                             has_thinking = True
                             thinking_text += chunk
-                            last_thinking_chunk = chunk  # 记录最后一个thinking chunk
                             frame_id += 1
-                            # logger.debug(f"d: {frame_id}")
+                            logger.info(f"current return FRAME: {frame_id}")
                             yield ResponseBuilder.build_thinking_token_frame(
                                 frame_id=frame_id, thinking_token=chunk,
                                 request_id=request_id, version=version
@@ -801,7 +780,6 @@ class NewsAgentOrchestrator:
                             emitted = True
                         else:
                             # 非thinking帧，暂存起来
-                            has_non_thinking = True
                             temp_items.append((kind, chunk))
                     except asyncio.QueueEmpty:
                         break
@@ -810,35 +788,17 @@ class NewsAgentOrchestrator:
                 for item in temp_items:
                     await text_frame_queue.put(item)
                 
-                # 关键修复：如果检测到非thinking帧（如text帧），说明thinking阶段已结束
-                # 应该立即退出第一阶段，进入第二阶段处理text和audio帧
-                if has_non_thinking:
-                    logger.info("检测到非thinking帧，thinking阶段结束，进入第二阶段")
-                    thinking_phase_done = True
-                    break
-                
                 # 如果没有thinking帧且文本生成已完成，thinking阶段结束
                 if not has_thinking:
                     if text_finished:
                         thinking_phase_done = True
                         break
-                    # 等待一下，看看是否有新的thinking帧或非thinking帧
+                    # 等待一下，看看是否有新的thinking帧
                     await asyncio.sleep(0.01)
                     # 如果文本生成已完成且队列为空，说明thinking阶段结束
                     if text_finished and text_frame_queue.empty():
                         thinking_phase_done = True
                         break
-
-            # 检查最后一个thinking帧是否已包含关闭标签，如果没有则添加
-            if last_thinking_chunk and not last_thinking_chunk.rstrip().endswith("</think>"):
-                # 最后一个thinking chunk没有关闭标签，需要添加
-                frame_id += 1
-                # logger.debug(f"d: {frame_id} (closing thinking tag)")
-                thinking_text += "</think>"
-                yield ResponseBuilder.build_thinking_token_frame(
-                    frame_id=frame_id, thinking_token="</think>",
-                    request_id=request_id, version=version
-                )
 
             # 第二阶段：输出text和audio帧（交替输出）
             while True:
@@ -855,7 +815,7 @@ class NewsAgentOrchestrator:
                         elif kind == "text":
                             full_text += chunk
                             frame_id += 1
-                            # logger.debug(f"d: {frame_id}")
+                            logger.info(f"current return FRAME: {frame_id}")
                             yield ResponseBuilder.build_text_token_frame(
                                 frame_id=frame_id, text_token=chunk,
                                 request_id=request_id, version=version
@@ -873,7 +833,7 @@ class NewsAgentOrchestrator:
                         else:
                             audio_chunk, audio_is_final = audio_item, False
                         frame_id += 1
-                        # logger.debug(f"d: {frame_id}")
+                        logger.info(f"current return FRAME: {frame_id}")
                         total_audio_chunks.append(audio_chunk)
                         yield ResponseBuilder.build_audio_token_frame(
                             frame_id=frame_id, audio_chunk=audio_chunk,
@@ -898,7 +858,7 @@ class NewsAgentOrchestrator:
                     else:
                         audio_chunk, audio_is_final = audio_item, False
                     frame_id += 1
-                    # logger.debug(f"d: {frame_id}")
+                    logger.info(f"current return FRAME: {frame_id}")
                     total_audio_chunks.append(audio_chunk)
                     yield ResponseBuilder.build_audio_token_frame(
                         frame_id=frame_id, audio_chunk=audio_chunk,
@@ -907,6 +867,13 @@ class NewsAgentOrchestrator:
                     )
                 except asyncio.QueueEmpty:
                     break
+
+            frame_id += 1
+            yield ResponseBuilder.build_final_stream_frame(
+                frame_id=frame_id, full_text=full_text, thinking_content=thinking_text,
+                request_id=request_id,
+                debug_info=build_debug_info_from_state(preprocessing_state, request_start_time)
+            )
 
         # 启动两个独立任务：文本生成和语音合成（无阻塞关系）
         text_task = asyncio.create_task(text_generator())
@@ -951,7 +918,7 @@ class NewsAgentOrchestrator:
             )
 
             frame_id += 1
-            # logger.debug(f"d: {frame_id}")
+            logger.info(f"current return FRAME: {frame_id}")
             yield ResponseBuilder.build_final_stream_frame(
                 frame_id=frame_id, full_text=full_text, thinking_content=thinking_text,
                 request_id=request_id, debug_info=debug_info if debug else None, version=version
