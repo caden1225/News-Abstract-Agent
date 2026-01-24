@@ -1,0 +1,53 @@
+#!/bin/bash
+# TTS测试示例
+
+echo "========================================"
+echo "TTS服务测试示例"
+echo "========================================"
+echo ""
+
+PROJECT_ROOT="/data/workspace/news-agent-c2"
+cd "$PROJECT_ROOT"
+
+echo "1️⃣  运行快速测试（约60秒）"
+echo "   $ ./quick_test.sh"
+echo ""
+
+echo "2️⃣  或者分步测试："
+echo ""
+echo "   a) 单元测试（15秒）"
+echo "      $ python test_tts_integration.py"
+echo ""
+echo "   b) 交互式测试（自定义）"
+echo "      $ python test_tts_interactive.py"
+echo ""
+echo "   c) 性能测试（30秒）"
+echo "      $ python test_tts_performance.py"
+echo ""
+
+echo "3️⃣  测试完整API链路："
+echo ""
+echo "   a) 启动服务器"
+echo "      $ export TTS_LOCAL_MODEL_DIR=/data/models/CosyVoice2-0_5B"
+echo "      $ python main.py"
+echo ""
+echo "   b) 在新终端测试API"
+echo "      $ python test_api_e2e.py"
+echo ""
+
+echo "4️⃣  音频处理："
+echo ""
+echo "   a) 转换PCM为WAV"
+echo "      $ python audio_utils.py convert test_tts_output.pcm"
+echo ""
+echo "   b) 播放音频"
+echo "      $ python audio_utils.py play test_tts_output.pcm"
+echo "      $ ffplay test_tts_output.wav"
+echo ""
+
+echo "========================================"
+echo "详细文档："
+echo "  - README_TESTING.md  (快速指南)"
+echo "  - TTS_TESTING_GUIDE.md (完整指南)"
+echo "  - TTS_INTEGRATION_SUMMARY.md (架构说明)"
+echo "========================================"

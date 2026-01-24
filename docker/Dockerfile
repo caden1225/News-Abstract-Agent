@@ -1,6 +1,6 @@
 # Python Agent Dockerfile for News TTS Agent
 # 使用与参考项目相同的基础镜像
-FROM news-agent-dev:20260119_ready_3
+FROM news-agent-dev:20260121_ready_c2
 
 # 指定运行时的系统环境变量
 ENV APP_NAME=news-tts-agent \
@@ -23,6 +23,7 @@ COPY requirements.txt /tmp/requirements.txt
 #     micromamba activate /opt/conda && \
 #     pip install --no-cache-dir -i http://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com -r /tmp/requirements.txt && \
 #     mkdir -p ${APP_HOME}/
+RUN pip install pyarrow pyworld
 
 # 复制应用代码
 COPY . ${APP_HOME}

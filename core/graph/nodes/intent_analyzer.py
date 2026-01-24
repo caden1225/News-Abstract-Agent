@@ -125,34 +125,29 @@ def analyze_intent_by_rules(query: str) -> Dict[str, Any]:
     # 默认值
     result = {
         "query_type": "general_news",
-        "intent_type": "today_hot",
         "target_date": date.today().isoformat(),
         "category": None,
-        "keywords": [],
         "search_keywords": [],
         "search_strategy": "by_date_only",
         "data_source": "cache",
-        "summary_target_language": summary_target_language,  # 改为summary_target_language
-        "tts_language": summary_target_language,  # 保持向后兼容
+        "summary_target_language": summary_target_language,
+        "tts_language": summary_target_language,
         "language_confidence": language_confidence
     }
 
     # 1. 判断时间
     if any(kw in query for kw in ["今天", "今日", "最新", "当前"]):
         result["query_type"] = "general_news"
-        result["intent_type"] = "today_hot"
         result["target_date"] = date.today().isoformat()
         result["data_source"] = "cache"
 
     elif any(kw in query for kw in ["昨天", "昨日"]):
         result["query_type"] = "daily_news"
-        result["intent_type"] = "specific_date"
         result["target_date"] = (date.today() - timedelta(days=1)).isoformat()
         result["data_source"] = "cache"
 
     elif any(kw in query for kw in ["前天"]):
         result["query_type"] = "daily_news"
-        result["intent_type"] = "specific_date"
         result["target_date"] = (date.today() - timedelta(days=2)).isoformat()
         result["data_source"] = "cache"
 
@@ -169,9 +164,7 @@ def analyze_intent_by_rules(query: str) -> Dict[str, Any]:
     for category, keywords in category_keywords.items():
         if any(kw in query_lower for kw in keywords):
             result["category"] = category
-            if "today" in result["intent_type"]:
-                result["intent_type"] = "today_category"
-                result["query_type"] = "category_news"
+            result["query_type"] = "category_news"
             break
 
     return result
@@ -392,40 +385,15 @@ async def intent_analyzer_node(state: NewsAgentState) -> Dict[str, Any]:
     else:
         data_source = "cache"
 
-    # 获取 query_type，如果不存在则从 intent_type 推断
-    query_type = result.get("query_type")
-    if not query_type:
-        # 从 intent_type 推断 query_type
-        intent_type = result.get("intent_type", "today_hot")
-        intent_type_to_query_type = {
-            "today_hot": "general_news",
-            "today_category": "category_news",
-            "specific_date": "daily_news",
-            "keyword_search": "keyword_search",
-        }
-        query_type = intent_type_to_query_type.get(intent_type, "general_news")
-
-    # 为了兼容旧代码，映射 query_type 到 intent_type
-    query_type_to_intent_type = {
-        "daily_news": "specific_date",
-        "category_news": "today_category",
-        "keyword_search": "keyword_search",
-        "general_news": "today_hot",
-    }
-    intent_type = query_type_to_intent_type.get(query_type, "today_hot")
+    query_type = result.get("query_type") or "general_news"
 
     # 构建返回状态
     update = {
-        # 新字段
         "query_type": query_type,
         "search_keywords": result.get("search_keywords", []),
         "search_strategy": search_strategy,
-
-        # 兼容旧字段
-        "intent_type": intent_type,
         "target_date": result.get("target_date"),
         "category": result.get("category"),
-        "keywords": result.get("search_keywords", []),
         "data_source": data_source,
 
         # 摘要目标语言配置（优先使用summary_target_language）

@@ -1,64 +1,87 @@
-# Python
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# C extensions
 *.so
+
+# Distribution / packaging
 .Python
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
 .eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
 *.egg
 
-# Virtual Environment
-venv/
-ENV/
-env/
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
 
-# IDE
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache/
+.pytest_cache/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Type checkers / linters
+.mypy_cache/
+.dmypy.json
+.dmypy/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# IDE/editor
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Database
-*.db-journal
-*.db-wal
-
-
-# Logs
-*.log
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Backup files
-*.backup
-*.bak
-*.old
+# Logs
+logs/
+*.log
 
-# Temporary files
+# Database files
+*.db-shm
+*.db-wal
+
+# Model caches
+modelscope_cache/
+.cache/
+~/.cache/
+
+# Local data / artifacts
+test_output/
 *.tmp
 *.temp
+*.bak
+
+# Node modules
+node_modules/
 
 # Environment variables
 .env
-# But allow .env.example to be committed
-!.env.example
+.env.local
+

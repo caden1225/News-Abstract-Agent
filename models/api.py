@@ -90,8 +90,8 @@ class AgentRequest(BaseModel):
     voice_zone: Optional[int] = None  # Voice zone (0=Invalid, 1=FrontLeft, 2=FrontRight, etc.)
     account_id: Optional[str] = None  # Login account ID (anonymized)
     user_id: Optional[str] = None  # User ID (anonymized)
-    channel_id: str  # Channel ID
-    vehicle_model: str  # Vehicle model/series（文档要求必填）
+    channel_id: Optional[str] = None  # Channel ID
+    vehicle_model: Optional[str] = None  # Vehicle model/series
     query: str  # ASR result, user's original speech query
     query_parts: Optional[List[QueryPart]] = None  # 用户的多模态请求
     query_type: Optional[str] = Field(None, alias="_query_type")  # e.g. text, omni
@@ -148,6 +148,7 @@ class ResponseData(BaseModel):
     frame_timestamp: Optional[int] = None  # Frame unix timestamp (milliseconds)
     frame_id: Optional[int] = None  # Frame ID, zero-based indexing
     frame_text: Optional[str] = None  # Unstructured frame data content
+    content: Optional[str] = None  # 统一文本内容出口（thinking/content）
     frame_parts: Optional[List[FramePart]] = None  # agent 的多模态响应，final 帧为 null
     frame_is_final: Optional[bool] = None  # Whether this is the final frame
     response_type: Optional[str] = None  # e.g. omni, thinking

@@ -6,7 +6,8 @@ import os
 import logging
 import uuid
 import json
-from typing import Optional
+import time
+from typing import Optional, Union
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -80,7 +81,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from core.orchestrator import NewsAgentOrchestrator
-from models.api import ChatRequest, HealthResponse
+from models.api import ChatRequest, AgentRequest, HealthResponse
 from scheduler.tasks import NewsScheduler
 from core.rate_limit import limiter, rate_limit_exceeded_handler, rate_limit_default
 from slowapi.errors import RateLimitExceeded
@@ -124,21 +125,73 @@ async def lifespan(app: FastAPI):
 
     # 初始化 TTS 服务
     from llm_utils.config import config as app_config
-    tts_enabled = app_config.get("tts.enabled", True)
-    
+    tts_config = app_config.get("tts", {})
+    tts_enabled = tts_config.get("enabled", True)
+    tts_mock = tts_config.get("mock", False)
+    tts_service = None
+
     if tts_enabled:
         try:
-            from tts_utils import get_tts_service
-            logger.info("正在初始化 TTS 服务...")
-            tts_service = get_tts_service()
-            logger.info("✅ TTS 服务初始化成功")
-            # 延迟验证：不在启动时调用 list_speakers()，避免段错误
-            # 说话人列表将在首次使用时获取
-            logger.info("  - TTS 服务已就绪，说话人列表将在首次使用时加载")
+            from tts_utils import get_tts_service, initialize_tts
+
+            # 检查当前选择的 TTS 服务类型
+            service_type = os.getenv("TTS_SERVICE_TYPE", "").lower() or tts_config.get("service_type", "cosyvoice2").lower()
+            is_dashscope = service_type == "dashscope"
+
+            # 如果是mock模式，使用Mock服务
+            if tts_mock:
+                logger.info("使用 Mock TTS 服务（配置模式）")
+                from tts_utils.mock_service import MockTTSService
+                tts_service = MockTTSService()
+                logger.info("✅ Mock TTS 服务初始化成功")
+                # 将TTS服务注入到orchestrator
+                if orchestrator:
+                    orchestrator.tts_service = tts_service
+                    logger.info("  - TTS 服务已注入到 Orchestrator")
+            else:
+                logger.info(f"正在初始化 TTS 服务 (类型: {service_type})...")
+                tts_service = get_tts_service()
+
+                # 初始化TTS模型（加载模型到内存）
+                init_result = await initialize_tts()
+                if init_result:
+                    logger.info("✅ TTS 服务初始化成功")
+                    # 将TTS服务注入到orchestrator
+                    if orchestrator:
+                        orchestrator.tts_service = tts_service
+                        logger.info("  - TTS 服务已注入到 Orchestrator")
+                else:
+                    # DashScope 服务不允许回退
+                    if is_dashscope:
+                        raise RuntimeError("DashScope TTS 服务初始化失败，不允许回退")
+                    logger.warning("⚠️  TTS 服务初始化失败，回退到 Mock 服务")
+                    from tts_utils.mock_service import MockTTSService
+                    tts_service = MockTTSService()
+                    if orchestrator:
+                        orchestrator.tts_service = tts_service
+                        logger.info("  - Mock TTS 服务已注入到 Orchestrator")
         except Exception as e:
+            # 检查是否是 DashScope 服务
+            service_type = os.getenv("TTS_SERVICE_TYPE", "").lower() or tts_config.get("service_type", "cosyvoice2").lower()
+            is_dashscope = service_type == "dashscope"
+            
+            if is_dashscope:
+                # DashScope 服务不允许回退，直接抛出异常
+                logger.error(f"❌ DashScope TTS 服务初始化失败: {e}", exc_info=True)
+                raise RuntimeError(f"DashScope TTS 服务初始化失败: {e}")
+            
+            # 其他服务允许回退
             logger.error(f"❌ TTS 服务初始化失败: {e}", exc_info=True)
-            logger.error("TTS 服务已启用但初始化失败，服务无法启动")
-            raise
+            logger.warning("回退到 Mock TTS 服务")
+            try:
+                from tts_utils.mock_service import MockTTSService
+                tts_service = MockTTSService()
+                if orchestrator:
+                    orchestrator.tts_service = tts_service
+                    logger.info("  - Mock TTS 服务已注入到 Orchestrator")
+            except Exception as mock_e:
+                logger.error(f"❌ Mock TTS 服务也初始化失败: {mock_e}", exc_info=True)
+                raise
     else:
         logger.info("ℹ️ TTS 服务已禁用（配置中 tts.enabled=false）")
 
@@ -252,7 +305,6 @@ async def lifespan(app: FastAPI):
     logger.info(f"📊 当前配置:")
     logger.info(f"  - 使用爬虫数据库: {os.getenv('CRAWLER_DB_PATH', '默认路径')}")
     logger.info(f"  - LLM模式: {os.getenv('LLM_MODE', 'openrouter')}")
-    logger.info(f"  - LLM摘要: {os.getenv('USE_LLM_FOR_SUMMARY', 'true')}")
     tts_model_dir = app_config.get("tts.local_model_dir", "未配置")
     tts_status = "已启用" if tts_enabled else "已禁用"
     logger.info(f"  - TTS服务: {tts_status} (模型目录: {tts_model_dir})")
@@ -367,7 +419,7 @@ async def health_check():
 
 @app.post("/api/v1/chat", tags=["新闻"])
 @rate_limit_default(limit="10/minute")  # 速率限制：每分钟10次请求
-async def chat(request: Request, chat_request: ChatRequest):
+async def chat(request: Request):
     """
     新闻查询接口
 
@@ -383,16 +435,69 @@ async def chat(request: Request, chat_request: ChatRequest):
     if not orchestrator:
         raise HTTPException(status_code=503, detail="服务未就绪")
 
-    # 生成请求ID
-    request_id = chat_request.request_id or generate_request_id()
+    # 尝试解析请求体，支持两种格式
+    body = await request.json()
 
-    logger.info(f"收到请求: request_id={request_id}, query={chat_request.query}, stream={chat_request.stream}")
+    # 判断请求格式：AgentRequest 有 version 和 vin 字段，ChatRequest 没有
+    if "version" in body and "vin" in body:
+        # 使用 AgentRequest（完整格式）
+        try:
+            agent_request = AgentRequest(**body)
+            request_id = agent_request.request_id
+            query = agent_request.query
+            stream = agent_request.stream
+            version = agent_request.version
+            debug = agent_request.debug or False
+            context = agent_request.context
+            history = agent_request.history
+            user_id = agent_request.user_id
+            conversation_id = agent_request.conversation_id
+            vin = agent_request.vin
+            channel_id = agent_request.channel_id
+            voice_zone = agent_request.voice_zone
+            timestamp = agent_request.timestamp
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"AgentRequest 格式错误: {str(e)}")
+    else:
+        # 使用 ChatRequest（简化格式，向后兼容）
+        try:
+            chat_request = ChatRequest(**body)
+            request_id = chat_request.request_id or generate_request_id()
+            query = chat_request.query
+            stream = chat_request.stream
+            version = "2.1"  # 默认版本
+            debug = chat_request.debug
+            context = None
+            history = None
+            user_id = None
+            conversation_id = None
+            vin = None
+            channel_id = None
+            voice_zone = None
+            timestamp = int(time.time() * 1000)  # 使用当前时间戳
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"ChatRequest 格式错误: {str(e)}")
+
+    logger.info(f"收到请求: request_id={request_id}, query={query}, stream={stream}, version={version}")
 
     try:
-        if chat_request.stream:
+        if stream:
             # 流式响应（SSE）
             return StreamingResponse(
-                stream_chat(chat_request.query, request_id),
+                stream_chat(
+                    query=query,
+                    request_id=request_id,
+                    version=version,
+                    debug=debug,
+                    context=context,
+                    history=history,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    vin=vin,
+                    channel_id=channel_id,
+                    voice_zone=voice_zone,
+                    timestamp=timestamp
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -401,7 +506,20 @@ async def chat(request: Request, chat_request: ChatRequest):
             )
         else:
             # 非流式响应（等待完整结果）
-            result = await get_chat_result(chat_request.query, request_id)
+            result = await get_chat_result(
+                query=query,
+                request_id=request_id,
+                version=version,
+                debug=debug,
+                context=context,
+                history=history,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                vin=vin,
+                channel_id=channel_id,
+                voice_zone=voice_zone,
+                timestamp=timestamp
+            )
             return result
 
     except Exception as e:
@@ -409,13 +527,36 @@ async def chat(request: Request, chat_request: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def stream_chat(query: str, request_id: str):
+async def stream_chat(
+    query: str,
+    request_id: str,
+    version: str = "2.1",
+    debug: bool = False,
+    context=None,
+    history=None,
+    user_id: str = None,
+    conversation_id: str = None,
+    vin: str = None,
+    channel_id: str = None,
+    voice_zone: int = None,
+    timestamp: int = None
+):
     """
     流式聊天响应生成器
 
     Args:
         query: 用户查询
         request_id: 请求ID
+        version: LLM Protocol 版本号
+        debug: 是否显示调试信息
+        context: 上下文信息
+        history: 历史对话记录
+        user_id: 用户ID
+        conversation_id: 会话ID
+        vin: 车辆VIN
+        channel_id: 渠道ID
+        voice_zone: 语音区域
+        timestamp: 请求时间戳
 
     Yields:
         SSE 格式的响应数据
@@ -424,7 +565,17 @@ async def stream_chat(query: str, request_id: str):
         async for response in orchestrator.process_query(
             query=query,
             request_id=request_id,
-            stream=True
+            stream=True,
+            version=version,
+            debug=debug,
+            context=context,
+            history=history,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            vin=vin,
+            channel_id=channel_id,
+            voice_zone=voice_zone,
+            timestamp=timestamp
         ):
             yield response
 
@@ -432,7 +583,7 @@ async def stream_chat(query: str, request_id: str):
         logger.error(f"流式响应失败: {e}", exc_info=True)
         # 返回错误响应
         error_response = {
-            "version": "2.1",
+            "version": version,
             "request_id": request_id,
             "code": 500,
             "message": str(e),
@@ -441,13 +592,36 @@ async def stream_chat(query: str, request_id: str):
         yield f"event:error\ndata:{json.dumps(error_response, ensure_ascii=False)}\n\n"
 
 
-async def get_chat_result(query: str, request_id: str):
+async def get_chat_result(
+    query: str,
+    request_id: str,
+    version: str = "2.1",
+    debug: bool = False,
+    context=None,
+    history=None,
+    user_id: str = None,
+    conversation_id: str = None,
+    vin: str = None,
+    channel_id: str = None,
+    voice_zone: int = None,
+    timestamp: int = None
+):
     """
     获取聊天结果（非流式）
 
     Args:
         query: 用户查询
         request_id: 请求ID
+        version: LLM Protocol 版本号
+        debug: 是否显示调试信息
+        context: 上下文信息
+        history: 历史对话记录
+        user_id: 用户ID
+        conversation_id: 会话ID
+        vin: 车辆VIN
+        channel_id: 渠道ID
+        voice_zone: 语音区域
+        timestamp: 请求时间戳
 
     Returns:
         完整响应数据
@@ -457,13 +631,23 @@ async def get_chat_result(query: str, request_id: str):
         async for response in orchestrator.process_query(
             query=query,
             request_id=request_id,
-            stream=True
+            stream=True,
+            version=version,
+            debug=debug,
+            context=context,
+            history=history,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            vin=vin,
+            channel_id=channel_id,
+            voice_zone=voice_zone,
+            timestamp=timestamp
         ):
             responses.append(response)
     except Exception as e:
         logger.error(f"获取聊天结果失败: {e}", exc_info=True)
         return {
-            "version": "2.1",
+            "version": version,
             "request_id": request_id,
             "code": 500,
             "message": str(e),
@@ -483,7 +667,7 @@ async def get_chat_result(query: str, request_id: str):
 
     # 默认响应
     return {
-        "version": "2.1",
+        "version": version,
         "request_id": request_id,
         "code": 0,
         "message": "success",

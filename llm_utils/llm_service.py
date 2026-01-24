@@ -11,7 +11,7 @@ LLM 服务模块
 """
 import logging
 from time import time
-from typing import Optional, AsyncGenerator, Tuple
+from typing import Optional, AsyncGenerator, Tuple, List, Dict, Any
 from openai import AsyncOpenAI
 from llm_utils.config import config
 from core.retry import retry_async, RetryConfig, with_timeout
@@ -38,6 +38,23 @@ class LLMService(object):
 
     def __init__(self):
         pass
+
+    @staticmethod
+    def _calc_input_length(messages: List[Dict[str, Any]]) -> int:
+        """
+        计算输入消息的总长度（按字符数统计）
+
+        Args:
+            messages: 消息列表
+
+        Returns:
+            所有 message.content 拼接后的字符长度
+        """
+        try:
+            return sum(len(str(m.get("content", ""))) for m in (messages or []))
+        except Exception as e:
+            logger.warning(f"计算LLM输入长度失败: {e}", exc_info=True)
+            return -1
 
     @staticmethod
     @retry_async(
@@ -72,7 +89,11 @@ class LLMService(object):
         Raises:
             LLMError: 调用失败时抛出异常
         """
-        logger.info(f"Calling LLM: model={model_name}, messages={len(messages)}, temperature={temperature}")
+        input_length = LLMService._calc_input_length(messages)
+        logger.info(
+            f"Calling LLM: model={model_name}, messages={len(messages)}, "
+            f"input_chars={input_length}, temperature={temperature}, max_tokens={max_tokens}"
+        )
 
         # 从配置获取超时时间
         if timeout is None:
@@ -132,7 +153,12 @@ class LLMService(object):
         """
         import re
         
-        logger.info(f"Calling LLM with thinking: model={model_name}, enable_thinking={enable_thinking}")
+        input_length = LLMService._calc_input_length(messages)
+        logger.info(
+            f"Calling LLM with thinking: model={model_name}, messages={len(messages)}, "
+            f"input_chars={input_length}, enable_thinking={enable_thinking}, "
+            f"temperature={temperature}, max_tokens={max_tokens}"
+        )
 
         params = {
             'model': model_name,
@@ -220,7 +246,12 @@ class LLMService(object):
         Raises:
             LLMError: 调用失败时抛出异常
         """
-        logger.info(f"Calling LLM (stream): model={model_name}, messages={len(messages)}, enable_thinking={enable_thinking}")
+        input_length = LLMService._calc_input_length(messages)
+        logger.info(
+            f"Calling LLM (stream): model={model_name}, messages={len(messages)}, "
+            f"input_chars={input_length}, enable_thinking={enable_thinking}, "
+            f"temperature={temperature}, max_tokens={max_tokens}"
+        )
 
         # 从配置获取超时时间（流式调用使用更长的超时）
         if timeout is None:

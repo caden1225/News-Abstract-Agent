@@ -1,0 +1,100 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache/
+.pytest_cache/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Type checkers / linters
+.mypy_cache/
+.dmypy.json
+.dmypy/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Local data / artifacts (ML/Audio)
+checkpoints/
+outputs/
+output/
+results/
+artifacts/
+media/
+assets/
+wandb/
+runs/
+
+# Hugging Face / model caches
+~/.cache/huggingface/
+.huggingface/
+
+# Torch / datasets caches
+~/.cache/torch/
+~/.cache/
+
+datasets/
+
+# Generated files
+*.tmp
+*.temp
+*.bak
+
+# Node (if any future UI assets)
+node_modules/
+
+# Project specific
+cosyvoice_minimal_tmp/
+**/generated/
+
+# Python version manager
+.python-version

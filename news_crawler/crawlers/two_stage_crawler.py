@@ -9,6 +9,7 @@ import time
 import random
 import asyncio
 import aiohttp
+import concurrent.futures
 from typing import List, Dict, Optional
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
@@ -18,6 +19,36 @@ from ..database import Database
 from ..logger_config import get_crawler_logger
 
 logger = get_crawler_logger(__name__)
+
+
+def _run_async_safely(coro):
+    """
+    安全地运行异步协程，无论是否已有事件循环在运行
+
+    Args:
+        coro: 异步协程对象
+
+    Returns:
+        协程的返回值
+    """
+    try:
+        # 尝试获取当前事件循环
+        loop = asyncio.get_running_loop()
+        # 如果已有事件循环在运行，创建一个新的事件循环在新线程中运行
+        def run_in_thread():
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                return new_loop.run_until_complete(coro)
+            finally:
+                new_loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(run_in_thread)
+            return future.result()
+    except RuntimeError:
+        # 没有运行中的事件循环，可以使用 asyncio.run()
+        return asyncio.run(coro)
 
 
 class TwoStageCrawler:
@@ -594,7 +625,7 @@ class TwoStageCrawler:
 
             # 第二阶段：并行获取详细内容
             if news_list:
-                detailed_news = asyncio.run(self._fetch_news_details_batch(news_list))
+                detailed_news = _run_async_safely(self._fetch_news_details_batch(news_list))
                 results['hot_news'] = detailed_news
 
         # 今日关注（如果配置不同的话）
@@ -602,7 +633,7 @@ class TwoStageCrawler:
             today_focus_list = self._fetch_news_list(self.config['today_focus'], 'today_focus')
 
             if today_focus_list:
-                detailed_focus = asyncio.run(self._fetch_news_details_batch(today_focus_list))
+                detailed_focus = _run_async_safely(self._fetch_news_details_batch(today_focus_list))
                 results['today_focus'] = detailed_focus
 
         return results

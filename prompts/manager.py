@@ -218,18 +218,22 @@ def clean_news_text(text: str) -> str:
     return cleaned_text
 
 
-def format_news_items(news_list: List[Dict[str, Any]], max_count: int = 5) -> str:
+def format_news_items(
+    news_list: List[Dict[str, Any]],
+    max_count: int = 5,
+    max_total_chars: int = 10_000,
+) -> str:
     """
     格式化新闻列表为模板所需的字符串
 
     Args:
         news_list: 新闻列表
         max_count: 最多处理多少条新闻
-
-    Returns:
-        格式化后的新闻字符串
+        max_total_chars: 汇总后的新闻内容（标题+正文）的最大总字数上限，
+                         超过该上限则不再追加新的新闻
     """
-    items = []
+    items: List[str] = []
+    total_chars = 0
 
     for i, news in enumerate(news_list[:max_count], 1):
         title = news.get("title", "")
@@ -239,11 +243,18 @@ def format_news_items(news_list: List[Dict[str, Any]], max_count: int = 5) -> st
         # 清洗文本
         summary_text = clean_news_text(summary_text)
 
-        # 限制长度
+        # 限制单条长度
         if len(summary_text) > 300:
             summary_text = summary_text[:300] + "..."
+        
+        item_str = f"【新闻{i}】\n标题：{title}\n内容：{summary_text}"
 
-        items.append(f"【新闻{i}】\n标题：{title}\n内容：{summary_text}")
+        # 如果再追加本条会导致总字数超过上限，则停止追加新的新闻
+        if total_chars + len(item_str) > max_total_chars:
+            break
+
+        items.append(item_str)
+        total_chars += len(item_str)
 
     return "\n".join(items)
 

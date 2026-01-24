@@ -631,7 +631,7 @@ class CrawlerService:
         
         # 兼容字段
         if 'summary' not in d:
-            content = d.get('content', '')
+            content = d.get('content') or ''  # 处理 None 值
             d['summary'] = content[:100] + '...' if len(content) > 100 else content
         
         if 'ai_summary' not in d:

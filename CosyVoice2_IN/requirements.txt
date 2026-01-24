@@ -1,0 +1,30 @@
+# CosyVoice Minimal Inference Requirements
+# 核心依赖
+transformers==4.51.3 # 不知道为什么会直接影响音频合成。。。
+omegaconf
+torch
+torchaudio
+numpy
+onnxruntime
+scipy==1.16.3
+conformer==0.3.2
+diffusers==0.35.2
+
+
+# 文本处理
+wetext==0.0.4
+inflect
+
+# 音频处理
+openai-whisper
+kaldifst>=1.0.0
+
+# 配置和工具
+hyperpyyaml>=1.2.0
+omegaconf>=2.3.0
+tqdm>=4.64.0
+modelscope>=1.9.0
+
+# 可选依赖（用于特定功能）
+# transformers>=4.30.0  # 如果使用Qwen tokenizer
+# tiktoken>=0.4.0      # 如果使用tiktoken

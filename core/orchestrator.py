@@ -1,32 +1,37 @@
 """
 新闻Agent主编排器
 整合LangGraph工作流和流式输出
-
-支持两种模式：
-1. 非流式模式：使用完整 LangGraph 工作流
-2. 流式模式（混合架构）：
-   - 前置处理使用 LangGraph ainvoke
-   - 流式生成（LLM + TTS）手动处理，实现真正的 token 级别流式
 """
 import time
 import asyncio
 import logging
-from typing import AsyncGenerator
+import base64
+import os
+from dataclasses import dataclass
+from typing import Any, AsyncGenerator, List
 
 from core.graph.workflow import build_preprocessing_workflow
 from models.state import NewsAgentState
 from prompts import build_news_summary_messages
-from core.utils import build_debug_info_from_state
 from core.response_builder import ResponseBuilder
-from core.tts_stream_processor import TTSStreamProcessor
 from llm_utils.config import config
 from llm_utils.llm_service import LLMService, llm_config
-from core.constants import LLM_CONFIG
-from tts_utils import get_tts_service
-from tts_utils.tts_optimization_utils import BackpressureController, AdaptiveTimeout
+from core.utils import build_debug_info_from_state
 
    
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PreprocessingResult:
+    """封装前置处理阶段的输出，便于后续流式阶段复用。"""
+    preprocessing_state: NewsAgentState
+    tts_language: str
+    image_links: List[str]
+    messages: List[dict]
+    model_name: str
+    enable_thinking: bool
+    tts_service: Any
 
 
 class NewsAgentOrchestrator:
@@ -38,128 +43,38 @@ class NewsAgentOrchestrator:
         self.preprocessing_workflow = build_preprocessing_workflow()
 
         # TTS服务初始化（单例模式，在启动时初始化）
-        self.tts_service = get_tts_service()
+        self.tts_service = None
         
         # LLM配置初始化
         self.llm_config = llm_config
         self.thinking_config = config.get_thinking_config()
-        
-        # TTS模型预热（方案B优化：降低首次请求延迟）
-        self._tts_warmed_up = False
-        
-        self._start_tts_warmup()
+        self.mock_all = os.getenv("MOCK_ALL", "false").lower() in ("true", "1", "yes")
 
         logger.info(
             f"NewsAgentOrchestrator 初始化完成: "
             f"TTS服务={self.tts_service}, "
             f"LLM模型={self.llm_config.get('model', 'unknown')}, "
-            f"thinking_enabled={self.thinking_config.get('enable_thinking', False)}"
+            f"thinking_enabled={self.thinking_config.get('enable_thinking', False)}, "
+            f"mock_all={self.mock_all}"
         )
     
-    def _start_tts_warmup(self):
-        """
-        启动TTS预热任务（如果事件循环存在）
-        
-        如果事件循环存在，创建后台任务进行预热
-        """
-        if self._tts_warmed_up:
-            return
-        
-        try:
-            # 尝试获取当前事件循环
-            loop = asyncio.get_running_loop()
-            # 如果成功获取到事件循环，创建后台任务
-            loop.create_task(self._warmup_tts_if_needed())
-            logger.info("✅ TTS预热任务已在后台启动")
-        except RuntimeError:
-            # 没有运行中的事件循环，跳过预热（不会在首次请求时预热）
-            logger.info("ℹ️ 当前无事件循环，跳过TTS预热")
-        except Exception as e:
-            logger.warning(f"⚠️ 启动TTS预热任务失败: {e}")
-
-    async def _warmup_tts_if_needed(self):
-        """如果需要，预热TTS模型（方案B优化）"""
-        if self._tts_warmed_up:
-            return
-
-        enable_warmup = config.get("tts.orchestrator.enable_warmup", "true").lower() in ("true", "1", "yes")
-        if not enable_warmup:
-            logger.info("TTS模型预热已禁用，跳过")
-            self._tts_warmed_up = True
-            return
-
-        try:
-            # 使用已初始化的TTS服务
-            tts_service = self.tts_service
-
-            if not tts_service or not tts_service.enabled:
-                logger.info("TTS服务未启用，跳过预热")
-                self._tts_warmed_up = True
-                return
-
-            warmup_timeout = float(config.get("tts.orchestrator.warmup_timeout", 15.0))
-            logger.info(f"开始预热TTS模型（超时: {warmup_timeout}秒）...")
-
-            start_time = time.time()
-
-            async def dummy_text_stream():
-                yield "你好，这是预热TTS的文本"
-
-            # 尝试进行一次TTS合成来预热模型
-            async def do_warmup():
-                chunk_count = 0
-                async for chunk in tts_service.synthesize_stream(
-                    text_stream=dummy_text_stream(),
-                    request_id="warmup"
-                ):
-                    chunk_count += 1
-                    # 只需要获取第一个chunk就足够预热了
-                    if chunk_count >= 1:
-                        break
-
-            await asyncio.wait_for(do_warmup(), timeout=warmup_timeout)
-            elapsed = time.time() - start_time
-
-            logger.info(f"✅ TTS模型预热完成，耗时: {elapsed:.2f}秒")
-            self._tts_warmed_up = True
-
-        except Exception as e:
-            logger.warning(f"⚠️ TTS模型预热失败: {e}，将在首次请求时初始化")
-            self._tts_warmed_up = True  # 标记为已尝试，避免重复
-
-    async def process_query(
+    def _build_initial_state(
         self,
         query: str,
         request_id: str,
-        stream: bool = True
-    ) -> AsyncGenerator[str, None]:
-        """
-        处理查询并返回流式响应
-
-        Args:
-            query: 用户查询
-            request_id: 请求ID
-            stream: 是否流式返回
-
-        Yields:
-            SSE格式的响应数据
-        """
-        logger.info(f"处理查询: query={query}, request_id={request_id}, stream={stream}")
-
-        # 构建初始状态
-        initial_state: NewsAgentState = {
+        stream: bool,
+    ) -> NewsAgentState:
+        """构建初始状态，便于在 process_query 与测试中复用。"""
+        return {
             "query": query,
             "request_id": request_id,
             "stream": stream,
-            # LLM 意图分析结果（新字段）
+            # LLM 意图分析结果
             "query_type": "",
             "search_keywords": [],
             "search_strategy": "",
-            # 兼容旧字段
-            "intent_type": "",
             "target_date": None,
             "category": None,
-            "keywords": [],
             "data_source": "",
             "cache_hit": False,
             "news_list": [],
@@ -177,7 +92,7 @@ class NewsAgentOrchestrator:
             "progress_percentage": 0,
             "image_links": [],
             # TTS语言配置
-            "tts_language": "zh",  # 默认中文
+            "tts_language": "zh",
             "language_confidence": 0.5,
             # LLM语言判断任务状态
             "llm_language_pending": False,
@@ -188,25 +103,177 @@ class NewsAgentOrchestrator:
             "completed": False
         }
 
+    @staticmethod
+    def _attach_context(initial_state: NewsAgentState, context) -> None:
+        """将外部 context 透传到状态，保持类型安全。"""
+        if context is None:
+            return
+
+        if hasattr(context, "dict"):
+            initial_state["_context"] = context.dict()
+        elif hasattr(context, "model_dump"):
+            initial_state["_context"] = context.model_dump()
+        elif isinstance(context, dict):
+            initial_state["_context"] = context
+        else:
+            initial_state["_context"] = str(context)
+
+    async def process_query(
+        self,
+        query: str,
+        request_id: str,
+        stream: bool = True,
+        version: str = "2.1",
+        debug: bool = False,
+        context=None,
+        history=None,
+        user_id: str = None,
+        conversation_id: str = None,
+        vin: str = None,
+        channel_id: str = None,
+        voice_zone: int = None,
+        timestamp: int = None
+    ) -> AsyncGenerator[str, None]:
+        """
+        处理查询并返回流式响应
+
+        Args:
+            query: 用户查询
+            request_id: 请求ID
+            stream: 是否流式返回
+            version: LLM Protocol 版本号
+            debug: 是否显示调试信息
+            context: 上下文信息
+            history: 历史对话记录
+            user_id: 用户ID
+            conversation_id: 会话ID
+            vin: 车辆VIN
+            channel_id: 渠道ID
+            voice_zone: 语音区域
+            timestamp: 请求时间戳
+
+        Yields:
+            SSE格式的响应数据
+        """
+        logger.info(f"处理查询: query={query}, request_id={request_id}, stream={stream}, version={version}")
+
+        initial_state = self._build_initial_state(query, request_id, stream)
+        self._attach_context(initial_state, context)
+
         try:
-            # 流式模式：使用混合架构
-            async for response in self._process_stream(initial_state, request_id):
+            async for response in self._process_stream(
+                initial_state,
+                request_id,
+                version,
+                debug=debug,
+                context=context,
+                history=history,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                vin=vin,
+                channel_id=channel_id,
+                voice_zone=voice_zone,
+                timestamp=timestamp
+            ):
                 yield response
 
         except Exception as e:
             logger.error(f"处理查询失败: {e}", exc_info=True)
-            yield ResponseBuilder.build_error_response(str(e), request_id)
+            yield ResponseBuilder.build_error_response(str(e), request_id, version)
+
+    async def _run_preprocessing_phase(
+        self,
+        initial_state: NewsAgentState,
+    ) -> PreprocessingResult:
+        """
+        第一阶段：调用 LangGraph 进行意图分析、数据获取与新闻选择。
+        """
+        # Mock模式：返回精简的mock数据
+        if self.mock_all:
+            logger.info("=== 阶段1：前置处理（MOCK模式）===")
+            await asyncio.sleep(0.1)  # 模拟处理延迟
+            
+            # 精简的mock数据
+            mock_preprocessing_state = {
+                **initial_state,
+                "query_type": "news_query",
+                "search_keywords": ["新闻"],
+                "selected_news": [
+                    {
+                        "title": "今日热点新闻",
+                        "summary": "这是一条精简的mock新闻摘要。",
+                        "url": "https://example.com/news/1"
+                    }
+                ],
+                "news_count": 1,
+                "tts_language": "zh",
+                "language_confidence": 0.9,
+                "image_links": [],
+                "cache_hit": False
+            }
+            
+            return PreprocessingResult(
+                preprocessing_state=mock_preprocessing_state,
+                tts_language="zh",
+                image_links=[],
+                messages=[{"role": "user", "content": "请生成新闻摘要"}],
+                model_name=self.llm_config.get("model", "mock-model"),
+                enable_thinking=self.thinking_config.get("enable_thinking", False),
+                tts_service=self.tts_service
+            )
+        ## end mock
+
+        logger.info("=== 阶段1：前置处理（LangGraph ainvoke）===")
+
+        preprocessing_state = await self.preprocessing_workflow.ainvoke(initial_state)
+
+        if preprocessing_state.get("error"):
+            error = preprocessing_state["error"]
+            logger.error(f"前置处理错误: {error}")
+            raise ValueError(error)
+
+        selected_news = preprocessing_state.get("selected_news", [])
+        tts_language = preprocessing_state.get("summary_target_language") or preprocessing_state.get("tts_language", "zh")
+        image_links = preprocessing_state.get("image_links", [])
+
+        logger.info(
+            f"前置处理完成: selected_news={len(selected_news)}, "
+            f"tts_language={tts_language}, image_links={len(image_links)}"
+        )
+
+        if not selected_news:
+            raise ValueError("未找到相关新闻")
+
+        messages = build_news_summary_messages(selected_news, target_language=tts_language)
+        model_name = self.llm_config["model"]
+        enable_thinking = self.thinking_config["enable_thinking"]
+
+        return PreprocessingResult(
+            preprocessing_state=preprocessing_state,
+            tts_language=tts_language,
+            image_links=image_links,
+            messages=messages,
+            model_name=model_name,
+            enable_thinking=enable_thinking,
+            tts_service=self.tts_service
+        )
 
     async def _process_stream(
         self,
         initial_state: NewsAgentState,
-        request_id: str
+        request_id: str,
+        version: str = "2.1",
+        debug: bool = False,
+        context=None,
+        history=None,
+        user_id: str = None,
+        conversation_id: str = None,
+        vin: str = None,
+        channel_id: str = None,
+        voice_zone: int = None,
+        timestamp: int = None
     ) -> AsyncGenerator[str, None]:
         """
-        流式处理（混合架构）
-        
-        1. 使用 LangGraph ainvoke 执行前置节点（意图分析 → 数据获取 → 新闻选择）
-        2. 手动执行流式生成：
            - LLM 流式输出 thinking tokens → 立即 yield
            - LLM 流式输出 content tokens → 立即 yield + 触发 TTS
            - TTS 返回音频块 → yield
@@ -219,507 +286,678 @@ class NewsAgentOrchestrator:
             SSE格式的响应数据
         """
         request_start_time = time.time()
-        frame_id = 0
-        
-        # 用于跟踪流式生成的音频块（用于debug info）
-        total_audo_chunks = []
-        
-        # ==================== 第一阶段：前置处理（LangGraph） ====================
-        logger.info("=== 阶段1：前置处理（LangGraph ainvoke）===")
-        
-        try:
-            # 使用前置工作流执行：意图分析 → 数据获取 → 新闻选择
-            preprocessing_state = await self.preprocessing_workflow.ainvoke(initial_state)
-            
-            # 检查是否有错误
-            if preprocessing_state.get("error"):
-                error = preprocessing_state["error"]
-                logger.error(f"前置处理错误: {error}")
-                yield ResponseBuilder.build_error_response(error, request_id)
-                return
-            
-            # 获取选中的新闻
-            selected_news = preprocessing_state.get("selected_news", [])
-            tts_language = preprocessing_state.get("summary_target_language") or preprocessing_state.get("tts_language", "zh")
-            image_links = preprocessing_state.get("image_links", [])
-            
-            logger.info(f"前置处理完成: selected_news={len(selected_news)}, tts_language={tts_language}, image_links={len(image_links)}")
-            
-            if not selected_news:
-                # todo 这里需要优化，应该返回一个更友好的错误信息
-                yield ResponseBuilder.build_error_response("未找到相关新闻", request_id)
-                return
-            
-            # 使用已初始化的TTS服务
-            tts_service = self.tts_service
-            
-            if image_links:
-                frame_id += 1
-                yield ResponseBuilder.build_image_frame(
-                    frame_id=frame_id,
-                    image_links=image_links,
-                    request_id=request_id
-                )
-                logger.info(f"已发送图片帧: {len(image_links)} 张图片")
+        # 让首帧从0开始计数，后续逐帧自增
+        frame_id = -1
 
-            # 使用已初始化的配置
-            thinking_config = self.thinking_config
-            model_name = self.llm_config['model']
-            enable_thinking = thinking_config["enable_thinking"]
-            messages = build_news_summary_messages(selected_news, target_language=tts_language)
-            # logger.info(f"✅ 并行准备完成: TTS服务已就绪（启动时已初始化）, messages已构建, model={model_name}")
-                
+        try:
+            preprocessing_result = await self._run_preprocessing_phase(
+                initial_state=initial_state,
+            )
         except Exception as e:
             logger.error(f"前置处理失败: {e}", exc_info=True)
-            yield ResponseBuilder.build_error_response(f"前置处理失败: {str(e)}", request_id)
+            yield ResponseBuilder.build_error_response(f"前置处理失败: {str(e)}", request_id, version)
             return
-        
-        # ==================== 第二阶段：流式生成（手动处理） ====================
-        # logger.info("=== 阶段2：流式生成（手动处理）===")
 
-        logger.info(f"开始流式生成: model={model_name}, enable_thinking={enable_thinking}")
-        
-        # 用于积累 content tokens
-        content_buffer = ""
-        
-        # 标记是否正在生成 thinking
-        in_thinking_phase = True
-        thinking_content = ""
-        
-        # 流式TTS集成：创建文本流生成器和队列
-        # 优化：添加背压控制，防止队列堆积
-        text_stream_queue: asyncio.Queue = asyncio.Queue(maxsize=200)  # 增大队列容量
-        audio_queue: asyncio.Queue = asyncio.Queue(maxsize=50)  # 音频队列
-        text_stream_done = False  # 标记文本流是否结束
-        audio_stream_done = False  # 标记音频流是否结束
-        
-        # 优化：创建背压控制器（BackpressureController已在顶部导入）
-        text_backpressure = BackpressureController(text_stream_queue, threshold=0.8)
-        
-        # TTS服务已在__init__中初始化
-        logger.info(f"TTS服务: service={tts_service}, enabled={getattr(tts_service, 'enabled', 'unknown') if tts_service else 'None'}, mock_mode={getattr(tts_service, 'mock_mode', 'False') if tts_service else 'None'}")
-        
-        async def text_stream_generator():
-            """
-            将队列中的文本token转换为流式生成器
-            """
-            adaptive_timeout = AdaptiveTimeout(
-                initial=0.1,
-                min_timeout=0.001,
-                max_timeout=0.3
+        if preprocessing_result.image_links:
+            frame_id += 1
+            logger.info(f"current return FRAME: {frame_id}")
+            yield ResponseBuilder.build_image_frame(
+                frame_id=frame_id,
+                image_links=preprocessing_result.image_links,
+                request_id=request_id,
+                version=version
             )
+            logger.info(f"已发送图片帧: {len(preprocessing_result.image_links)} 张图片")
+
+        async for stream_frame in self._stream_llm_and_tts(
+            frame_id=frame_id,
+            preprocessing_state=preprocessing_result.preprocessing_state,
+            messages=preprocessing_result.messages,
+            model_name=preprocessing_result.model_name,
+            enable_thinking=preprocessing_result.enable_thinking,
+            tts_language=preprocessing_result.tts_language,
+            tts_service=preprocessing_result.tts_service,
+            request_id=request_id,
+            version=version,
+            debug=debug,
+            request_start_time=request_start_time,
+            initial_state=initial_state,
+            history=history,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            vin=vin,
+            channel_id=channel_id,
+            voice_zone=voice_zone,
+            timestamp=timestamp
+        ):
+            yield stream_frame
+
+    async def _stream_llm_and_tts(
+        self,
+        frame_id: int,
+        preprocessing_state: NewsAgentState,
+        messages: list,
+        model_name: str,
+        enable_thinking: bool,
+        tts_language: str,
+        tts_service,
+        request_id: str,
+        version: str,
+        debug: bool,
+        request_start_time: float,
+        initial_state: NewsAgentState,
+        history=None,
+        user_id: str = None,
+        conversation_id: str = None,
+        vin: str = None,
+        channel_id: str = None,
+        voice_zone: int = None,
+        timestamp: int = None
+    ) -> AsyncGenerator[str, None]:
+        """
+        1. 文本生成阶段：LLM流式输出 -> thinking立即输出，content累积后输出
+        2. 语音合成阶段：独立运行，一个文本chunk对应一个音频chunk
+        """
+        # Mock模式
+        if self.mock_all:
+            logger.info(f"开始流式生成（MOCK模式）: model={model_name}, enable_thinking={enable_thinking}")
+            mock_thinking = "<think>正在思考</think>"
+            mock_content = "正在摘要。这是一条精简的mock新闻摘要内容。"
+            mock_audio_chunks = [
+                base64.b64encode(b"RIFF_MOCK_AUDIO_1").decode("utf-8"),
+                base64.b64encode(b"RIFF_MOCK_AUDIO_2").decode("utf-8")
+            ]
             
-            while True:
-                try:
-                    if text_stream_done and text_stream_queue.empty():
-                        break
-                    
-                    try:
-                        # 优化：使用自适应超时
-                        timeout = adaptive_timeout.get_timeout()
-                        token = await asyncio.wait_for(
-                            text_stream_queue.get(),
-                            timeout=timeout
-                        )
-                        
-                        if token is None:  # 结束信号
-                            break
-                        
-                        # 直接yield token，不缓冲（优化：消除双重缓冲）
-                        # TTS的SentenceBuffer会负责分句和缓冲
-                        adaptive_timeout.adjust(has_data=True)  # 有数据，减小超时
-                        yield token
-                        logger.debug(f"✅ Token已yield给TTS: {token[:20]}...")
-                            
-                    except asyncio.TimeoutError:
-                        # 超时，调整超时时间
-                        adaptive_timeout.adjust(has_data=False)  # 无数据，增大超时
-                        
-                        # 检查是否已完成
-                        if text_stream_done and text_stream_queue.empty():
-                            break
-                        # 继续循环，等待下一个token
-                        continue
-                        
-                except Exception as e:
-                    logger.error(f"文本流生成器错误: {e}", exc_info=True)
-                    break
-        
-        tts_task = None
-        try:
-            logger.info(f"准备启动流式TTS任务: request_id={request_id}, language={tts_language}, service={tts_service}")
-            if tts_service is None:
-                logger.warning("TTS服务未初始化，跳过音频合成")
-            else:
-                # 使用TTSStreamProcessor处理流式TTS
-                tts_processor = TTSStreamProcessor(
-                    tts_service=tts_service,
-                    language=tts_language,
-                    request_id=request_id
-                )
-                tts_task = asyncio.create_task(
-                    tts_processor.process_tts_stream(
-                        text_stream_generator(),
-                        audio_queue
-                    )
-                )
-                logger.info(f"✅ 流式TTS任务已启动: request_id={request_id}")
-        except Exception as e:
-            logger.error(f"启动流式TTS任务失败: {e}", exc_info=True)
-        
-        # ==================== 优化：简化音频队列架构 ====================
-        # 从3层队列简化为2层：audio_queue -> pending_audio_chunks（直接事件通知）
-        # 减少中间层，降低延迟和复杂度
-        audio_ready_event = asyncio.Event()
-        pending_audio_chunks = []  # 待yield的音频chunk列表（线程安全：仅在主循环中修改）
-        
-        async def audio_monitor_task():
-            """
-            音频监控任务（优化：简化架构）
-            直接从audio_queue获取音频，放入pending列表并通知主循环
-            """
-            while not audio_stream_done or not audio_queue.empty():
-                try:
-                    # 使用较短的超时，快速响应
-                    try:
-                        audio_chunk_data = await asyncio.wait_for(
-                            audio_queue.get(),
-                            timeout=0.01  # 10ms超时，快速响应
-                        )
-                        # 直接添加到待处理列表（主循环会处理）
-                        pending_audio_chunks.append(audio_chunk_data)
-                        audio_ready_event.set()  # 立即通知主循环
-                        logger.debug(f"✅ 音频块已准备好: request_id={request_id}")
-                    except asyncio.TimeoutError:
-                        # 超时，继续检查
-                        continue
-                except Exception as e:
-                    logger.error(f"音频监控任务错误: {e}")
-                    break
-        
-        # 启动音频监控任务（简化：只有一个监控任务）
-        audio_monitor_task_handle = None
-        if tts_service:
-            audio_monitor_task_handle = asyncio.create_task(audio_monitor_task())
-        
-        # 辅助函数：处理并yield音频块列表
-        async def process_and_yield_audio_chunks(chunks_list):
-            """
-            处理并yield音频块列表
-            
-            Args:
-                chunks_list: 音频块列表（会被修改，从中pop元素）
-            
-            Yields:
-                SSE格式的音频帧响应
-            """
-            nonlocal frame_id  # 使用外层计数器
-            while chunks_list:
-                audio_chunk_data = chunks_list.pop(0)
+            if enable_thinking:
                 frame_id += 1
-                total_audo_chunks.append(audio_chunk_data)
+                yield ResponseBuilder.build_thinking_token_frame(
+                    frame_id=frame_id, thinking_token="<think>正在思考", request_id=request_id, version=version
+                )
+                await asyncio.sleep(0.1)
+                frame_id += 1
+                yield ResponseBuilder.build_thinking_token_frame(
+                    frame_id=frame_id, thinking_token="</think>", request_id=request_id, version=version
+                )
+                await asyncio.sleep(0.1)
+            
+            frame_id += 1
+            yield ResponseBuilder.build_text_token_frame(
+                frame_id=frame_id, text_token="正在摘要。", request_id=request_id, version=version
+            )
+            await asyncio.sleep(0.1)
+            frame_id += 1
+            yield ResponseBuilder.build_text_token_frame(
+                frame_id=frame_id, text_token="这是一条精简的mock新闻摘要内容。", request_id=request_id, version=version
+            )
+            await asyncio.sleep(0.1)
+            
+            for i, audio_chunk in enumerate(mock_audio_chunks):
+                frame_id += 1
                 yield ResponseBuilder.build_audio_token_frame(
-                    frame_id=frame_id,
-                    audio_chunk=audio_chunk_data,
-                    is_final=False,
-                    request_id=request_id
+                    frame_id=frame_id, audio_chunk=audio_chunk,
+                    is_final=(i == len(mock_audio_chunks) - 1), request_id=request_id, version=version
                 )
-                logger.debug(f"✅ 音频块已yield: frame_id={frame_id}, request_id={request_id}")
-        
-        try:
-            # 流式调用 LLM
-            async for token_type, token_content in LLMService.call_llm_stream(
-                model_name=model_name,
-                messages=messages,
-                temperature=LLM_CONFIG.SUMMARY_TEMPERATURE,
-                max_tokens=LLM_CONFIG.SUMMARY_MAX_TOKENS,
-                enable_thinking=enable_thinking
-            ):
-                # 处理结束信号
-                if token_type == "done":
-                    logger.info(f"LLM流式响应结束: request_id={request_id}")
-                    break
-                
-                # 在每次LLM token到来时，先yield所有待处理的音频块
-                async for audio_frame in process_and_yield_audio_chunks(pending_audio_chunks):
-                    yield audio_frame
-                
-                # 清空事件标志
-                audio_ready_event.clear()
-                
-                if token_type == "thinking":
-                    # Thinking token → 立即 yield thinking 帧（独立返回）
-                    thinking_content += token_content
-                    frame_id += 1
-                    yield ResponseBuilder.build_thinking_token_frame(
-                        frame_id=frame_id,
-                        thinking_token=token_content,
-                        request_id=request_id
-                    )
-                    
-                elif token_type == "content":  # content token
-                    # 第一个 content token 表示 thinking 阶段结束
-                    if in_thinking_phase:
-                        in_thinking_phase = False
-                        logger.info(f"Thinking 阶段结束，开始 Content 阶段")
-                    
-                    # 累积 content
-                    content_buffer += token_content
-                    
-                    # Content token → 立即 yield 文本帧（独立返回）
-                    frame_id += 1
-                    yield ResponseBuilder.build_text_token_frame(
-                        frame_id=frame_id,
-                        text_token=token_content,
-                        request_id=request_id
-                    )
-                    
-                    # 优化：使用背压控制器发送文本token（自动处理队列满的情况）
-                    try:
-                        await text_backpressure.put(token_content)
-                    except Exception as e:
-                        logger.error(f"发送文本到TTS流失败: {e}")
-                        # 如果背压控制失败，记录警告但继续处理
-                        logger.warning(f"TTS文本流队列背压控制失败，跳过token: {token_content[:20]}...")
-                    
-                    # 优化：统一音频处理逻辑，避免重复代码
-                    # 在yield文本后，立即检查并处理所有待处理的音频块
-                    if pending_audio_chunks or audio_ready_event.is_set():
-                        async for audio_frame in process_and_yield_audio_chunks(pending_audio_chunks):
-                            yield audio_frame
-                        audio_ready_event.clear()
+                await asyncio.sleep(0.1)
             
-            # LLM 生成完成，发送结束信号给TTS流
-            text_stream_done = True
-            try:
-                text_stream_queue.put_nowait(None)
-            except:
-                pass  # 队列可能已满，忽略
-            
-            # 优化：非阻塞等待TTS任务完成，在等待期间持续yield音频块
-            if tts_task:
-                text_length = len(content_buffer)
-                max_wait_for_tts = float(config.get("tts.orchestrator.max_wait_for_tts", 30.0))
-
-                logger.info(
-                    f"等待TTS任务完成: request_id={request_id}, "
-                    f"文本长度={text_length}字符, 超时={max_wait_for_tts}秒"
-                )
-
-                # 非阻塞等待：在等待TTS完成的同时，持续yield音频块
-                start_wait_time = time.time()
-                tts_completed = False
-                
-                while not tts_completed:
-                    # 检查TTS任务是否已完成
-                    if tts_task.done():
-                        try:
-                            await tts_task  # 获取结果或异常
-                            tts_completed = True
-                            logger.info(f"✅ TTS任务已完成: request_id={request_id}")
-                        except Exception as e:
-                            logger.error(f"TTS任务异常: {e}", exc_info=True)
-                            tts_completed = True
-                        break
-                    
-                    # 检查是否超时
-                    elapsed = time.time() - start_wait_time
-                    if elapsed >= max_wait_for_tts:
-                        logger.warning(
-                            f"⚠️ TTS任务超时（{max_wait_for_tts}秒）: request_id={request_id}, "
-                            f"已生成部分音频"
-                        )
-                        break
-                    
-                    # 先yield所有待处理的音频块（非阻塞）
-                    if pending_audio_chunks or audio_ready_event.is_set():
-                        async for audio_frame in process_and_yield_audio_chunks(pending_audio_chunks):
-                            yield audio_frame
-                        audio_ready_event.clear()
-                    
-                    # 也检查原始音频队列（非阻塞）
-                    while not audio_queue.empty():
-                        try:
-                            audio_chunk_data = audio_queue.get_nowait()
-                            pending_audio_chunks.append(audio_chunk_data)
-                        except asyncio.QueueEmpty:
-                            break
-                    
-                    # 如果还有待处理的音频块，立即yield
-                    if pending_audio_chunks:
-                        async for audio_frame in process_and_yield_audio_chunks(pending_audio_chunks):
-                            yield audio_frame
-                        continue
-                    
-                    # 等待一小段时间，避免CPU占用过高（但不要太长，保证响应速度）
-                    # 使用 asyncio.wait_for 等待音频事件或短暂超时
-                    try:
-                        await asyncio.wait_for(
-                            audio_ready_event.wait(),
-                            timeout=0.1  # 100ms超时，快速响应
-                        )
-                    except asyncio.TimeoutError:
-                        # 超时，继续检查TTS任务状态
-                        continue
-                
-                # TTS任务完成后，再等待一小段时间让音频监控任务处理完剩余音频
-                await asyncio.sleep(0.2)
-                
-                # 最后处理所有剩余的音频块
-                while pending_audio_chunks or not audio_queue.empty():
-                    # 处理pending列表
-                    async for audio_frame in process_and_yield_audio_chunks(pending_audio_chunks):
-                        yield audio_frame
-                    
-                    # 从队列中获取更多音频块
-                    while not audio_queue.empty():
-                        try:
-                            audio_chunk_data = audio_queue.get_nowait()
-                            pending_audio_chunks.append(audio_chunk_data)
-                        except asyncio.QueueEmpty:
-                            break
-                    
-                    # 如果还有待处理的，继续yield
-                    if pending_audio_chunks:
-                        async for audio_frame in process_and_yield_audio_chunks(pending_audio_chunks):
-                            yield audio_frame
-                    else:
-                        # 没有更多音频块，退出循环
-                        break
-                    
-                    # 短暂等待，避免CPU占用过高
-                    await asyncio.sleep(0.05)
-            else:
-                logger.warning(f"⚠️ TTS任务未启动: request_id={request_id}")
-            
-            # 标记音频流完成
-            audio_stream_done = True
-            
-            # 优化：等待音频监控任务完成（简化：只有一个任务）
-            if audio_monitor_task_handle:
-                try:
-                    await asyncio.wait_for(audio_monitor_task_handle, timeout=2.0)
-                except asyncio.TimeoutError:
-                    logger.warning(f"音频监控任务超时: request_id={request_id}")
-                except Exception as e:
-                    logger.error(f"音频监控任务错误: {e}")
-            
-            # 输出所有剩余的待处理音频chunk（优化：简化，只有一个pending列表）
-            remaining_audio_count = 0
-            
-            # 处理pending列表中的音频块
-            async for audio_frame in process_and_yield_audio_chunks(pending_audio_chunks):
-                remaining_audio_count += 1
-                yield audio_frame
-            
-            # 也检查原始音频队列（以防有遗漏）
-            while not audio_queue.empty():
-                try:
-                    audio_chunk_data = audio_queue.get_nowait()
-                    remaining_audio_count += 1
-                    frame_id += 1
-                    total_audo_chunks.append(audio_chunk_data)
-                    yield ResponseBuilder.build_audio_token_frame(
-                        frame_id=frame_id,
-                        audio_chunk=audio_chunk_data,
-                        is_final=False,
-                        request_id=request_id
-                    )
-                except asyncio.QueueEmpty:
-                    break
-            
-            if remaining_audio_count > 0:
-                logger.info(f"✅ 输出剩余 {remaining_audio_count} 个音频块: request_id={request_id}")
-            
-            # 记录音频块统计信息
-            total_audio_chunks = len(total_audo_chunks)
-            logger.info(f"📊 音频块统计: 已记录 {total_audio_chunks} 个音频块到tracker, request_id={request_id}")
-            
-            # 构建最终状态（用于提取debug_info）
-            # 确保包含所有TTS相关信息
             final_state = {
                 **preprocessing_state,
-                "summary": content_buffer,
-                "thinking_chain": [],  # thinking_content已经在extension中
-                "streaming_text": content_buffer,
-                "streaming_audio_chunks": total_audo_chunks,  # 添加音频块追踪
-                "tts_language": tts_language,  # 确保包含TTS语言
-                "language_confidence": preprocessing_state.get("language_confidence", 0.9),  # 确保包含语言置信度
+                "summary": mock_content,
+                "thinking_chain": [mock_thinking] if enable_thinking else [],
+                "streaming_text": mock_content,
+                "streaming_audio_chunks": mock_audio_chunks,
+                "tts_language": tts_language,
+                "language_confidence": preprocessing_state.get("language_confidence", 0.9),
                 "completed": True
             }
             
-            # 从状态中提取debug_info
-            debug_info = build_debug_info_from_state(final_state, request_start_time)
-            
-            # 验证debug_info中的音频块数量
-            if debug_info.get("tts"):
-                audio_chunk_count_in_debug = debug_info["tts"].get("audioChunkCount", 0)
-                logger.info(f"📊 Debug Info中的音频块数量: {audio_chunk_count_in_debug}, request_id={request_id}")
-            
-            # 发送最终帧（包含图片链接和debug_info）
-            frame_id += 1
-            yield ResponseBuilder.build_final_stream_frame(
-                frame_id=frame_id,
-                full_text=content_buffer,
-                thinking_content=thinking_content,
-                image_links=image_links,
-                request_id=request_id,
-                debug_info=debug_info
+            debug_info = build_debug_info_from_state(
+                final_state, request_start_time, debug=debug, version=version,
+                query=initial_state.get("query", ""), history=history,
+                user_id=user_id, conversation_id=conversation_id, vin=vin,
+                channel_id=channel_id, voice_zone=voice_zone, timestamp=timestamp,
+                stream=initial_state.get("stream", True)
             )
             
-            logger.info(f"流式生成完成: thinking={len(thinking_content)}字符, content={len(content_buffer)}字符")
-            
-        except Exception as e:
-            logger.error(f"流式生成失败: {e}", exc_info=True)
-            # 确保音频任务也能退出
-            audio_stream_done = True
-            if audio_monitor_task_handle:
-                try:
-                    audio_monitor_task_handle.cancel()
-                except:
-                    pass
-            yield ResponseBuilder.build_error_response(f"流式生成失败: {str(e)}", request_id)
+            frame_id += 1
+            yield ResponseBuilder.build_final_stream_frame(
+                frame_id=frame_id, full_text=mock_content,
+                thinking_content=mock_thinking if enable_thinking else "",
+                request_id=request_id, debug_info=debug_info if debug else None, version=version
+            )
+            logger.info(f"流式生成完成（MOCK模式）: thinking={len(mock_thinking)}字符, content={len(mock_content)}字符")
+            return
 
-    # 注意：以下方法已迁移到 ResponseBuilder 和 TTSStreamProcessor
-    # 保留这些注释以便将来参考
-    # - _process_tts_stream -> TTSStreamProcessor.process_tts_stream
-    # - _generate_tts_chunk -> TTSStreamProcessor.generate_tts_chunk
-    # - _build_* 方法 -> ResponseBuilder.build_* 方法
+        logger.info(f"开始流式生成: model={model_name}, enable_thinking={enable_thinking}")
 
+        # 配置参数（与 TTS 服务的 SentenceBuffer 配置保持一致）
+        tts_min_length = int(config.get("tts.buffer.min_length", 15))
+        tts_max_length = int(config.get("tts.buffer.max_length", 200))
+        max_latency = float(config.get("tts.buffer.max_wait_time", 1.0))
+        
+        # 句子结束标点集合（与 SentenceBuffer 保持一致）
+        SENTENCE_ENDINGS = {'。', '.', '！', '!', '？', '?', '；', ';', '\n', '\r\n'}
+        # 用于安全位置分割的标点集合
+        SAFE_SPLIT_PUNCTUATION = {'。', '，', '！', '？', '；', '：', '、', '…', '—', '——', ',', ';', ':'}
 
-# ==================== 测试代码 ====================
+        # 队列：文本帧队列（thinking/text）、TTS输入队列、音频输出队列
+        text_frame_queue: asyncio.Queue = asyncio.Queue(maxsize=50)  # (kind, chunk)
+        tts_queue: asyncio.Queue = asyncio.Queue()  # 文本chunk，用于TTS合成
+        audio_queue: asyncio.Queue = asyncio.Queue(maxsize=100)  # (audio_base64, is_last)
+        
+        # 状态
+        full_text = ""
+        thinking_text = ""
+        total_audio_chunks: List[str] = []
+        text_generation_done = asyncio.Event()
+        tts_done = asyncio.Event()
 
-if __name__ == "__main__":
-    import asyncio
-
-    async def test_orchestrator():
-        """测试编排器"""
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        logger.info(
+            f"TTS服务: service={tts_service}, "
+            f"enabled={getattr(tts_service, 'enabled', 'unknown') if tts_service else 'None'}"
         )
 
-        orchestrator = NewsAgentOrchestrator()
+        def _find_safe_split_position(text: str, max_len: int) -> int:
+            """在最大长度附近找到安全的分割位置（标点处）"""
+            if len(text) <= max_len:
+                return -1
+            
+            # 在最大长度的前后50个字符内查找标点
+            search_start = max(0, max_len - 50)
+            search_end = min(len(text), max_len + 50)
+            
+            # 优先查找句子结束标点
+            for ending in SENTENCE_ENDINGS:
+                pos = text.rfind(ending, search_start, search_end)
+                if pos != -1:
+                    return pos
+            
+            # 其次查找其他安全标点
+            for punct in SAFE_SPLIT_PUNCTUATION:
+                pos = text.rfind(punct, search_start, search_end)
+                if pos != -1:
+                    return pos
+            
+            return -1
 
-        print("\n" + "=" * 70)
-        print("测试编排器（流式模式）")
-        print("=" * 70 + "\n")
+        def _find_sentence_boundary(text: str) -> int:
+            """向后查找最早的句子结束标点位置"""
+            earliest_pos = len(text)
+            found = False
+            
+            for ending in SENTENCE_ENDINGS:
+                pos = text.find(ending)
+                if pos != -1 and pos < earliest_pos:
+                    earliest_pos = pos
+                    found = True
+            
+            return earliest_pos if found else -1
 
-        frame_count = 0
-        async for response in orchestrator.process_query(
-            query="今天有什么新闻",
-            request_id="test_001",
-            stream=True
-        ):
-            frame_count += 1
-            # 简化输出
-            if len(response) > 200:
-                print(f"Frame {frame_count}: {response[:200]}...")
-            else:
-                print(f"Frame {frame_count}: {response}")
+        def _extract_text_chunk(buffer: str, force: bool = False) -> tuple[str, str]:
+            """
+            从缓冲区提取文本chunk（智能分割）
+            
+            Args:
+                buffer: 待分割的文本缓冲区
+                force: 是否强制分割（即使未达到最小长度）
+            
+            Returns:
+                (chunk, remaining_buffer) - 提取的chunk和剩余缓冲区
+            """
+            if not buffer:
+                return "", ""
+            
+            # 超过最大长度，尝试在安全位置分割
+            if len(buffer) >= tts_max_length:
+                split_pos = _find_safe_split_position(buffer, tts_max_length)
+                if split_pos > 0:
+                    chunk = buffer[:split_pos + 1].strip()
+                    remaining = buffer[split_pos + 1:].strip()
+                    return chunk, remaining
+                # 无法找到安全位置，强制分割
+                chunk = buffer[:tts_max_length].strip()
+                remaining = buffer[tts_max_length:].strip()
+                return chunk, remaining
+            
+            # 查找句子边界
+            if len(buffer) >= tts_min_length or force:
+                boundary_pos = _find_sentence_boundary(buffer)
+                if boundary_pos != -1:
+                    sentence = buffer[:boundary_pos + 1].strip()
+                    if len(sentence) >= tts_min_length or force:
+                        remaining = buffer[boundary_pos + 1:].strip()
+                        return sentence, remaining
+                
+                # 强制模式：返回整个buffer（即使没有找到句子边界）
+                if force:
+                    return buffer.strip(), ""
+            
+            # 未达到分割条件
+            return "", buffer
 
-        print("\n" + "=" * 70)
-        print(f"测试完成，共 {frame_count} 帧")
-        print("=" * 70)
+        def _should_flush_text(buffer: str, last_ts: float, now: float) -> bool:
+            """判断content文本是否应该刷新到TTS"""
+            if not buffer:
+                return False
+            
+            # 超过最大长度
+            if len(buffer) >= tts_max_length:
+                return True
+            
+            # 达到最小长度且找到句子边界
+            if len(buffer) >= tts_min_length:
+                boundary_pos = _find_sentence_boundary(buffer)
+                if boundary_pos != -1:
+                    return True
+            
+            # 超时且达到最小长度
+            if (now - last_ts) >= max_latency and len(buffer) >= tts_min_length:
+                return True
+            
+            return False
 
-    asyncio.run(test_orchestrator())
+        async def text_generator():
+            """阶段1：文本生成 - LLM流式输出，thinking和content都累积后输出"""
+            nonlocal full_text, thinking_text
+            content_buf = ""
+            thinking_buf = ""
+            last_content_ts = time.time()
+            last_thinking_ts = time.time()
+            thinking_started = False
+            thinking_ended = False  # 标记thinking是否已结束
+
+            async def flush_content(force=False):
+                """刷新content文本到TTS队列（智能分割）"""
+                nonlocal content_buf, last_content_ts
+                if not content_buf:
+                    return
+                
+                now = time.time()
+                if not force and not _should_flush_text(content_buf, last_content_ts, now):
+                    return
+                
+                # 智能提取chunk
+                chunk, remaining = _extract_text_chunk(content_buf, force=force)
+                if not chunk:
+                    return
+                
+                content_buf = remaining
+                last_content_ts = now
+                
+                # 同时输出文本帧和提交TTS
+                await text_frame_queue.put(("text", chunk))
+                await tts_queue.put(chunk)
+                logger.debug(f"[TTS_INPUT] request_id={request_id}, len={len(chunk)}, preview={chunk[:60]}")
+
+            async def flush_thinking(force=False):
+                """刷新thinking文本，立即输出（不等待最小长度），不提交TTS"""
+                nonlocal thinking_buf, thinking_started, last_thinking_ts, thinking_ended
+                if not thinking_buf:
+                    return
+                
+                now = time.time()
+                
+                # thinking文本应该立即输出，不需要等待达到最小长度
+                # 但可以设置一个小的超时（如0.1秒）来批量输出，减少帧数
+                thinking_timeout = 0.1  # 0.1秒超时，批量输出thinking
+                should_flush = force or (
+                    len(thinking_buf) >= tts_max_length or  # 超过最大长度
+                    (now - last_thinking_ts) >= thinking_timeout  # 超时
+                )
+                
+                if not should_flush:
+                    return
+                
+                # thinking文本直接输出，不需要智能分割（因为thinking是连续的思考过程）
+                # 但如果超过最大长度，需要分割
+                if len(thinking_buf) > tts_max_length:
+                    chunk = thinking_buf[:tts_max_length]
+                    thinking_buf = thinking_buf[tts_max_length:]
+                else:
+                    chunk = thinking_buf
+                    thinking_buf = ""
+                
+                # 如果thinking_buf被清空且是force模式，说明thinking已结束
+                if force and not thinking_buf:
+                    thinking_ended = True
+                
+                last_thinking_ts = now
+                
+                # 添加标签
+                if force:
+                    if not thinking_started:
+                        chunk_with_tags = f"<think>{chunk}</think>"
+                    else:
+                        chunk_with_tags = chunk + "</think>"
+                    thinking_started = False
+                else:
+                    if not thinking_started:
+                        chunk_with_tags = f"<think>{chunk}"
+                        thinking_started = True
+                    else:
+                        chunk_with_tags = chunk
+                
+                # thinking立即输出，不提交TTS
+                await text_frame_queue.put(("thinking", chunk_with_tags))
+                logger.debug(f"[THINKING_OUTPUT] request_id={request_id}, len={len(chunk)}, preview={chunk[:60]}")
+
+            try:
+                llm_service = LLMService()
+                async for token_type, token_content in llm_service.call_llm_stream(
+                    self.llm_config['model'], messages, temperature=0.7, max_tokens=1500,
+                    enable_thinking=enable_thinking
+                ):
+                    if token_type == "done":
+                        break
+                    if token_content:
+                        if token_type == "thinking":
+                            thinking_buf += token_content
+                            await flush_thinking()  # thinking累积后输出
+                        elif token_type == "content":
+                            # 检测thinking是否刚结束（从thinking切换到content）
+                            # 如果这是第一个content token且thinking_buf为空，说明thinking刚结束
+                            thinking_just_ended = False
+                            if not thinking_ended and thinking_buf == "" and not thinking_started:
+                                # thinking已结束，这是第一个content token
+                                thinking_ended = True
+                                thinking_just_ended = True
+                                logger.debug(f"[THINKING_ENDED] request_id={request_id}, 检测到thinking结束，开始处理content")
+                            
+                            content_buf += token_content
+                            # 统一调用flush_content，传入thinking_just_ended参数
+                            await flush_content()
+            except Exception as e:
+                logger.error(f"LLM消费失败: {e}", exc_info=True)
+                await text_frame_queue.put(("error", str(e)))
+            finally:
+                # 强制刷新剩余内容
+                await flush_content(force=True)
+                await text_frame_queue.put(("done", None))
+                await tts_queue.put(None)  # 发送结束信号
+                text_generation_done.set()
+
+        async def tts_synthesizer():
+            """阶段2：语音合成 - 独立运行，将TTS生成的音频按8KB切分后下发"""
+            if not tts_service or not getattr(tts_service, 'enabled', True):
+                logger.warning(f"⚠️ TTS服务未初始化，跳过音频合成: request_id={request_id}")
+                tts_done.set()
+                return
+            
+            # 导入AudioChunker
+            from core.audio_chunker import AudioChunker
+            
+            try:
+                # 创建音频分块器（8192字节 = 8KB）
+                chunker = AudioChunker(chunk_size=8192)
+                
+                # 用于延迟下发，确保真正的最后一帧被标记为 is_final=True
+                last_chunk_b64 = None
+                
+                pending_chunk = None
+                should_exit = False
+                while not should_exit:
+                    # 从文本队列获取下一段待合成文本
+                    if pending_chunk is None:
+                        text_chunk = await tts_queue.get()
+                    else:
+                        text_chunk = pending_chunk
+                        pending_chunk = None
+                    
+                    if text_chunk is None:
+                        break
+                    
+                    # 侦听下一个文本块（预取）
+                    try:
+                        next_chunk = tts_queue.get_nowait()
+                        if next_chunk is None:
+                            # None 信号被预取，标记退出但先处理当前 chunk
+                            should_exit = True
+                            pending_chunk = None
+                        else:
+                            pending_chunk = next_chunk
+                    except asyncio.QueueEmpty:
+                        pending_chunk = None
+                    
+                    # 调用TTS引擎，传递语言参数
+                    audio_bytes = await tts_service.synthesize(
+                        text=text_chunk, 
+                        spk_id=None,
+                        language=tts_language
+                    )
+                    
+                    # 送入分块器进行8KB切割
+                    new_chunks = chunker.add_audio(audio_bytes)
+                    
+                    # 关键逻辑：保留最后一包不发，直到确认它是或者不是最后一包
+                    for chunk in new_chunks:
+                        if last_chunk_b64 is not None:
+                            # 发送之前的包，标记为非结束
+                            await audio_queue.put((last_chunk_b64, False))
+                        last_chunk_b64 = base64.b64encode(chunk).decode("utf-8")
+                    
+                    logger.debug(f"[TTS合成进度] 文本分片={len(text_chunk)}字, 新增音频分片={len(new_chunks)}")
+
+                # 文本全部处理完，刷新分块器残余数据
+                final_remainder = chunker.flush()
+                if final_remainder:
+                    if last_chunk_b64 is not None:
+                        await audio_queue.put((last_chunk_b64, False))
+                    last_chunk_b64 = base64.b64encode(final_remainder).decode("utf-8")
+                
+                # 📢 下发整个流的最后一包音频
+                if last_chunk_b64 is not None:
+                    logger.info(f"✅ TTS生产结束: 正在放入最后一包音频数据到队列 (size={len(last_chunk_b64)} base64 chars)")
+                    await audio_queue.put((last_chunk_b64, True))
+                else:
+                    # 防御性逻辑：如果没有音频产生，发送一包空数据作为流结束标志
+                    logger.warning("⚠️ TTS未产生任何音频，发送空包作为结束标志")
+                    await audio_queue.put(("", True))
+
+                # 统计
+                stats = chunker.get_stats()
+                logger.info(f"📊 TTS分块统计: 输入={stats['total_input_bytes']}B, 输出={stats['total_output_chunks']}块")
+                
+            except Exception as e:
+                logger.error(f"❌ TTS合成任务崩溃: {e}", exc_info=True)
+            finally:
+                tts_done.set()
+                logger.info("🏁 tts_synthesizer 协程已退出")
+
+        async def dispatcher():
+            """统一调度：先完全输出所有thinking帧，然后交替输出text和audio帧"""
+            nonlocal frame_id, full_text, thinking_text
+            text_finished = False
+            thinking_phase_done = False  # thinking阶段是否完成
+            last_thinking_chunk = None  # 跟踪最后一个输出的thinking chunk
+
+            # 第一阶段：完全排空所有thinking帧
+            while not thinking_phase_done:
+                emitted = False
+                
+                # 检查并输出所有thinking帧
+                temp_items = []
+                has_thinking = False
+                has_non_thinking = False  # 标记是否有非thinking帧
+                
+                # 先取出队列中的所有项
+                while not text_frame_queue.empty():
+                    try:
+                        kind, chunk = text_frame_queue.get_nowait()
+                        if kind == "done":
+                            text_finished = True
+                            thinking_phase_done = True  # thinking阶段结束
+                            break
+                        elif kind == "error":
+                            logger.error(f"文本处理错误: {chunk}")
+                        elif kind == "thinking":
+                            has_thinking = True
+                            thinking_text += chunk
+                            last_thinking_chunk = chunk  # 记录最后一个thinking chunk
+                            frame_id += 1
+                            # logger.debug(f"d: {frame_id}")
+                            yield ResponseBuilder.build_thinking_token_frame(
+                                frame_id=frame_id, thinking_token=chunk,
+                                request_id=request_id, version=version
+                            )
+                            emitted = True
+                        else:
+                            # 非thinking帧，暂存起来
+                            has_non_thinking = True
+                            temp_items.append((kind, chunk))
+                    except asyncio.QueueEmpty:
+                        break
+                
+                # 将非thinking帧放回队列（等待第二阶段处理）
+                for item in temp_items:
+                    await text_frame_queue.put(item)
+                
+                # 关键修复：如果检测到非thinking帧（如text帧），说明thinking阶段已结束
+                # 应该立即退出第一阶段，进入第二阶段处理text和audio帧
+                if has_non_thinking:
+                    logger.info("检测到非thinking帧，thinking阶段结束，进入第二阶段")
+                    thinking_phase_done = True
+                    break
+                
+                # 如果没有thinking帧且文本生成已完成，thinking阶段结束
+                if not has_thinking:
+                    if text_finished:
+                        thinking_phase_done = True
+                        break
+                    # 等待一下，看看是否有新的thinking帧或非thinking帧
+                    await asyncio.sleep(0.01)
+                    # 如果文本生成已完成且队列为空，说明thinking阶段结束
+                    if text_finished and text_frame_queue.empty():
+                        thinking_phase_done = True
+                        break
+
+            # 检查最后一个thinking帧是否已包含关闭标签，如果没有则添加
+            if last_thinking_chunk and not last_thinking_chunk.rstrip().endswith("</think>"):
+                # 最后一个thinking chunk没有关闭标签，需要添加
+                frame_id += 1
+                # logger.debug(f"d: {frame_id} (closing thinking tag)")
+                thinking_text += "</think>"
+                yield ResponseBuilder.build_thinking_token_frame(
+                    frame_id=frame_id, thinking_token="</think>",
+                    request_id=request_id, version=version
+                )
+
+            # 第二阶段：输出text和audio帧（交替输出）
+            while True:
+                emitted = False
+
+                # 处理text帧
+                if not text_frame_queue.empty():
+                    try:
+                        kind, chunk = text_frame_queue.get_nowait()
+                        if kind == "done":
+                            text_finished = True
+                        elif kind == "error":
+                            logger.error(f"文本处理错误: {chunk}")
+                        elif kind == "text":
+                            full_text += chunk
+                            frame_id += 1
+                            # logger.debug(f"d: {frame_id}")
+                            yield ResponseBuilder.build_text_token_frame(
+                                frame_id=frame_id, text_token=chunk,
+                                request_id=request_id, version=version
+                            )
+                            emitted = True
+                    except asyncio.QueueEmpty:
+                        pass
+
+                # 处理音频帧
+                if not audio_queue.empty():
+                    try:
+                        audio_item = audio_queue.get_nowait()
+                        if isinstance(audio_item, tuple) and len(audio_item) >= 2:
+                            audio_chunk, audio_is_final = audio_item[0], bool(audio_item[1])
+                        else:
+                            audio_chunk, audio_is_final = audio_item, False
+                        frame_id += 1
+                        # logger.debug(f"d: {frame_id}")
+                        total_audio_chunks.append(audio_chunk)
+                        yield ResponseBuilder.build_audio_token_frame(
+                            frame_id=frame_id, audio_chunk=audio_chunk,
+                            is_final=audio_is_final, request_id=request_id, version=version
+                        )
+                        emitted = True
+                    except asyncio.QueueEmpty:
+                        pass
+
+                if not emitted:
+                    # 两个阶段都完成且队列为空，退出
+                    if text_finished and tts_done.is_set() and audio_queue.empty() and text_frame_queue.empty():
+                        break
+                    await asyncio.sleep(0.01)
+
+            # 排空剩余音频队列
+            while not audio_queue.empty():
+                try:
+                    audio_item = audio_queue.get_nowait()
+                    if isinstance(audio_item, tuple) and len(audio_item) >= 2:
+                        audio_chunk, audio_is_final = audio_item[0], bool(audio_item[1])
+                    else:
+                        audio_chunk, audio_is_final = audio_item, False
+                    frame_id += 1
+                    # logger.debug(f"d: {frame_id}")
+                    total_audio_chunks.append(audio_chunk)
+                    yield ResponseBuilder.build_audio_token_frame(
+                        frame_id=frame_id, audio_chunk=audio_chunk,
+                        is_final=audio_is_final or audio_queue.empty(),
+                        request_id=request_id, version=version
+                    )
+                except asyncio.QueueEmpty:
+                    break
+
+        # 启动两个独立任务：文本生成和语音合成（无阻塞关系）
+        text_task = asyncio.create_task(text_generator())
+        tts_task = asyncio.create_task(tts_synthesizer())
+
+        try:
+            async for frame in dispatcher():
+                yield frame
+        except Exception as e:
+            logger.error(f"流式生成失败: {e}", exc_info=True)
+            yield ResponseBuilder.build_error_response(f"流式生成失败: {str(e)}", request_id, version)
+        finally:
+            # 等待任务完成（无阻塞关系，可以并行等待）
+            for task in [text_task, tts_task]:
+                try:
+                    await asyncio.wait_for(task, timeout=float(config.get("tts.orchestrator.max_wait_for_tts", 30.0)))
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    if not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+
+            final_state = {
+                **preprocessing_state,
+                "summary": full_text,
+                "thinking_chain": [],
+                "streaming_text": full_text,
+                "streaming_audio_chunks": total_audio_chunks,
+                "tts_language": tts_language,
+                "language_confidence": preprocessing_state.get("language_confidence", 0.9),
+                "completed": True
+            }
+
+            debug_info = build_debug_info_from_state(
+                final_state, request_start_time, debug=debug, version=version,
+                query=initial_state.get("query", ""), history=history,
+                user_id=user_id, conversation_id=conversation_id, vin=vin,
+                channel_id=channel_id, voice_zone=voice_zone, timestamp=timestamp,
+                stream=initial_state.get("stream", True)
+            )
+
+            frame_id += 1
+            # logger.debug(f"d: {frame_id}")
+            yield ResponseBuilder.build_final_stream_frame(
+                frame_id=frame_id, full_text=full_text, thinking_content=thinking_text,
+                request_id=request_id, debug_info=debug_info if debug else None, version=version
+            )
+
+            logger.info(
+                f"流式生成完成: thinking={len(thinking_text)}字符, content={len(full_text)}字符, "
+                f"audio_chunks={len(total_audio_chunks)}"
+            )

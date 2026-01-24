@@ -2,13 +2,24 @@
 从处理状态中构建debug_info的工具函数
 """
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from models.state import NewsAgentState
 
 
 def build_debug_info_from_state(
     state: NewsAgentState,
-    request_start_time: Optional[float] = None
+    request_start_time: Optional[float] = None,
+    debug: bool = False,
+    version: str = "2.1",
+    query: str = "",
+    history: Optional[List] = None,
+    user_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    vin: Optional[str] = None,
+    channel_id: Optional[str] = None,
+    voice_zone: Optional[int] = None,
+    timestamp: Optional[int] = None,
+    stream: bool = True
 ) -> Dict[str, Any]:
     """
     从处理状态中提取并构建debug_info
@@ -16,18 +27,73 @@ def build_debug_info_from_state(
     Args:
         state: 处理状态
         request_start_time: 请求开始时间（可选，用于计算总耗时）
+        debug: 是否显示调试信息
+        version: LLM Protocol 版本号
+        query: 用户查询
+        history: 历史对话记录
+        user_id: 用户ID
+        conversation_id: 会话ID
+        vin: 车辆VIN
+        channel_id: 渠道ID
+        voice_zone: 语音区域
+        timestamp: 请求时间戳
+        stream: 是否流式响应
         
     Returns:
         整理后的debug_info字典
     """
     debug_info = {}
     
-    # 1. 请求基本信息
-    debug_info["request"] = {
-        "query": state.get("query", ""),
-        "requestId": state.get("request_id", ""),
-        "stream": state.get("stream", False)
+    # 1. 请求基本信息（tiny_stone 风格 + 当前项目的详细信息）
+    request_info = {
+        "query": query or state.get("query", ""),
+        "request_id": state.get("request_id", ""),
+        "stream": stream or state.get("stream", False)
     }
+    
+    # 添加 tiny_stone 风格的请求字段（如果提供）
+    if debug:
+        request_info["debug"] = debug
+        request_info["version"] = version
+        request_info["stream"] = stream
+        
+        if history is not None:
+            # 转换 history 为字典格式（如果包含 Pydantic 模型）
+            try:
+                if hasattr(history, '__iter__') and len(history) > 0:
+                    history_list = []
+                    for h in history:
+                        if hasattr(h, 'dict'):
+                            history_list.append(h.dict())
+                        elif hasattr(h, 'model_dump'):
+                            history_list.append(h.model_dump())
+                        elif isinstance(h, dict):
+                            history_list.append(h)
+                        else:
+                            history_list.append(str(h))
+                    request_info["history"] = history_list
+            except Exception as e:
+                request_info["history"] = []
+        
+        if user_id is not None:
+            request_info["user_id"] = user_id
+        if conversation_id is not None:
+            request_info["conversation_id"] = conversation_id
+        if vin is not None:
+            request_info["vin"] = vin
+        if channel_id is not None:
+            request_info["channel_id"] = channel_id
+        if voice_zone is not None:
+            request_info["voice_zone"] = voice_zone
+        if timestamp is not None:
+            request_info["timestamp"] = timestamp
+    
+    debug_info["request"] = request_info
+    
+    # 计算总耗时（tiny_stone 风格）
+    if request_start_time:
+        total_time = int((time.time() - request_start_time) * 1000)
+        debug_info["totalTime"] = total_time
     
     # 2. 意图分析信息
     query_type = state.get("query_type", "")

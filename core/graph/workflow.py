@@ -6,8 +6,8 @@ from langgraph.graph import StateGraph, END
 from models.state import NewsAgentState
 from core.graph.nodes import (
     intent_analyzer_node,
-    cache_query_node,  # 重命名：cache_checker_node -> cache_query_node
-    fetch_data_node,   # 新增：统一处理关键词搜索和在线获取
+    cache_query_node,
+    fetch_data_node,
     news_selector_node,
     summarizer_node,
     tts_generator_node,
@@ -28,17 +28,11 @@ def decide_data_source(state: NewsAgentState) -> str:
         "cache" - 使用缓存
         "fetch" - 获取数据（关键词搜索或在线获取）
     """
-    # 优先使用新的 query_type 字段
     query_type = state.get("query_type", "")
-    intent_type = state.get("intent_type", "")  # 兼容旧字段
-    
-    logger.info(f"数据源决策: query_type={query_type}, intent_type={intent_type}")
+    logger.info(f"数据源决策: query_type={query_type}")
     
     # 关键词搜索或指定日期查询 -> 获取数据
-    if (query_type == "keyword_search" or 
-        query_type == "daily_news" or 
-        intent_type == "keyword_search" or 
-        intent_type == "specific_date"):
+    if query_type in ("keyword_search", "daily_news"):
         return "fetch"
     
     # 其他情况 -> 检查缓存
@@ -97,8 +91,8 @@ def build_news_workflow() -> StateGraph:
     # ==================== 添加节点 ====================
 
     workflow.add_node("intent_analyzer", intent_analyzer_node)
-    workflow.add_node("cache_query", cache_query_node)  # 重命名
-    workflow.add_node("fetch_data", fetch_data_node)   # 新增
+    workflow.add_node("cache_query", cache_query_node)
+    workflow.add_node("fetch_data", fetch_data_node)
     workflow.add_node("news_selector", news_selector_node)
     workflow.add_node("summarizer", summarizer_node)
     workflow.add_node("tts_generator", tts_generator_node)
@@ -223,77 +217,3 @@ def build_preprocessing_workflow() -> StateGraph:
     logger.info("前置处理工作流构建完成")
 
     return compiled_workflow
-
-
-# ==================== 测试代码 ====================
-
-# if __name__ == "__main__":
-#     import asyncio
-#     from datetime import date
-
-#     async def test_workflow():
-#         """测试工作流"""
-#         logging.basicConfig(
-#             level=logging.INFO,
-#             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-#         )
-
-#         # 构建工作流
-#         workflow = build_news_workflow()
-
-#         # 初始状态
-#         initial_state: NewsAgentState = {
-#             "query": "今天有什么新闻",
-#             "request_id": "test_001",
-#             "stream": True,
-#             # 新字段 (LLM提取)
-#             "query_type": "",
-#             "search_keywords": [],
-#             "search_strategy": "",
-#             "intent_reasoning": None,
-#             # 兼容旧字段
-#             "intent_type": "",
-#             "keywords": [],
-#             "target_date": None,
-#             "category": None,
-#             "data_source": "",
-#             "cache_hit": False,
-#             "news_list": [],
-#             "news_count": 0,
-#             "selected_news": [],
-#             "summary": "",
-#             "audio_data": None,
-#             "processing_steps": [],
-#             "current_step": "",
-#             "progress_percentage": 0,
-#             "image_links": [],
-#             "error": None,
-#             "completed": False
-#         }
-
-#         # 执行工作流
-#         print("\n" + "=" * 70)
-#         print("开始执行工作流")
-#         print("=" * 70 + "\n")
-
-#         result = await workflow.ainvoke(initial_state)
-
-#         print("\n" + "=" * 70)
-#         print("工作流执行完成")
-#         print("=" * 70)
-#         print(f"\n处理步骤:")
-#         for step in result.get("processing_steps", []):
-#             print(f"  - {step}")
-
-#         print(f"\n最终状态:")
-#         print(f"  新闻数量: {result.get('news_count', 0)}")
-#         print(f"  图片数量: {len(result.get('image_links', []))}")
-#         print(f"  摘要长度: {len(result.get('summary', ''))}")
-#         print(f"  音频数据: {'有' if result.get('audio_data') else '无'}")
-#         print(f"  完成: {result.get('completed', False)}")
-
-#         if result.get("error"):
-#             print(f"\n⚠️ 错误: {result['error']}")
-
-#     # 运行测试
-#     asyncio.run(test_workflow())

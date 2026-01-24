@@ -20,9 +20,7 @@ async def cache_query_node(state: NewsAgentState) -> Dict[str, Any]:
     缓存查询节点
     检查数据库是否有缓存数据
     """
-    # 优先使用 query_type，兼容 intent_type
     query_type = state.get("query_type", "")
-    intent_type = state.get("intent_type", "")
     target_date = state.get("target_date", date.today().isoformat())
     category = state.get("category")
 
@@ -34,7 +32,6 @@ async def cache_query_node(state: NewsAgentState) -> Dict[str, Any]:
     # 输入状态
     print(f"📥 输入状态:")
     print(f"  - query_type: {query_type}")
-    print(f"  - intent_type: {intent_type}")
     print(f"  - target_date: {target_date}")
     print(f"  - category: {category}")
 

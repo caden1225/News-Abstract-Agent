@@ -296,15 +296,6 @@ async def generate_summary_with_llm(
         (thinking_content, summary) 元组
     """
     from llm_utils.llm_service import LLMService, llm_config
-    import os
-
-    # 检查是否启用LLM
-    use_llm = os.getenv("USE_LLM_FOR_SUMMARY", "true").lower() == "true"
-
-    if not use_llm:
-        logger.info("LLM摘要已禁用，使用简单拼接")
-        summary = generate_simple_summary(news_list)
-        return ("使用简单拼接方式生成摘要", summary)
 
     try:
         # 构建 messages（使用统一的 prompt 管理系统）

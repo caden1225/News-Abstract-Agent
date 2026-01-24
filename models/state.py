@@ -21,10 +21,6 @@ class NewsAgentState(TypedDict):
     search_keywords: List[str]              # 搜索关键词列表 (最多3个)
     search_strategy: str                     # 检索策略: by_date_and_category / by_date_only / by_keyword / by_all
 
-    # ==================== 兼容字段 (保留以兼容旧代码) ====================
-    intent_type: str                        # 兼容字段，映射到 query_type
-    keywords: List[str]                     # 兼容字段，映射到 search_keywords
-
     # ==================== 数据源决策 ====================
     data_source: str                        # cache / fetch / hybrid
     cache_hit: bool                         # 是否命中缓存
@@ -51,9 +47,6 @@ class NewsAgentState(TypedDict):
 
     # ==================== 多模态数据 ====================
     image_links: List[str]                  # 图片链接列表
-
-    # ==================== 思维链 ====================
-    thinking_chain: Annotated[List[Dict[str, Any]], operator.add]  # 思维链步骤列表（累加）
 
     # ==================== TTS语言配置 ====================
     tts_language: str                       # TTS语言: "zh" (中文) / "en" (英文) / "ko" (韩语)

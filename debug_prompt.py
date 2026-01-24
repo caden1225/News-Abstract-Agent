@@ -294,10 +294,12 @@ async def test_llm_call(template_name: str, **kwargs):
                     max_tokens=2000,
                     enable_thinking=True
                 ):
-                    if token_type == "thinking":
+                    if token_type == "done":
+                        break  # 流式响应结束
+                    elif token_type == "thinking":
                         thinking_content += token_content
                         print(f"{token_content}", end="", flush=True)
-                    else:
+                    elif token_type == "content":
                         if in_thinking:
                             in_thinking = False
                             print("\n\n【CONTENT】\n")

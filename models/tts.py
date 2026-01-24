@@ -51,9 +51,9 @@ class SentenceBuffer:
     
     def __init__(
         self,
-        min_length: int = 10,  # 最小句子长度（字符数）
+        min_length: int = 15,  # 最小句子长度（字符数）
         max_length: int = 200,  # 最大句子长度（超过则强制分割）
-        max_wait_time: float = 2.0  # 最大等待时间（秒），超时则输出当前缓冲区
+        max_wait_time: float = 1.0  # 最大等待时间（秒），超时则输出当前缓冲区
     ):
         self.min_length = min_length
         self.max_length = max_length

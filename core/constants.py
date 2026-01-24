@@ -3,8 +3,17 @@
 
 集中管理所有硬编码的魔法数字和配置常量
 """
+import os
 from dataclasses import dataclass
 from typing import Dict
+
+# 加载 .env 文件（必须在读取环境变量之前）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # 如果 dotenv 未安装，跳过（环境变量可能已通过其他方式设置）
+    pass
 
 
 @dataclass
@@ -127,9 +136,63 @@ class WorkflowConfig:
     PROGRESS_COMPLETE: int = 100
 
 
+@dataclass
+class StreamConfig:
+    """流式输出配置"""
+    # 文本chunk合并配置（从环境变量读取，支持.env文件）
+    TEXT_CHUNK_MIN_SIZE: int = 15  # 最小累积字符数
+    TEXT_CHUNK_MAX_SIZE: int = 80  # 最大累积字符数（超过则强制yield）
+    TEXT_CHUNK_TIMEOUT: float = 0.3  # 最大等待时间（秒）
+    TEXT_CHUNK_SENTENCE_ENDINGS: str = "。！？.!?；;"  # 句子结束标点
+
+    def __post_init__(self):
+        """从环境变量读取配置（支持.env文件）"""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # 从环境变量读取配置，如果没有或为空则使用默认值
+        min_size_env = os.getenv("TEXT_CHUNK_MIN_SIZE")
+        if min_size_env and min_size_env.strip():
+            try:
+                self.TEXT_CHUNK_MIN_SIZE = int(min_size_env.strip())
+                logger.debug(f"从环境变量读取 TEXT_CHUNK_MIN_SIZE={self.TEXT_CHUNK_MIN_SIZE}")
+            except ValueError:
+                logger.warning(f"环境变量 TEXT_CHUNK_MIN_SIZE 值无效: {min_size_env}，使用默认值 {self.TEXT_CHUNK_MIN_SIZE}")
+        
+        max_size_env = os.getenv("TEXT_CHUNK_MAX_SIZE")
+        if max_size_env and max_size_env.strip():
+            try:
+                self.TEXT_CHUNK_MAX_SIZE = int(max_size_env.strip())
+                logger.debug(f"从环境变量读取 TEXT_CHUNK_MAX_SIZE={self.TEXT_CHUNK_MAX_SIZE}")
+            except ValueError:
+                logger.warning(f"环境变量 TEXT_CHUNK_MAX_SIZE 值无效: {max_size_env}，使用默认值 {self.TEXT_CHUNK_MAX_SIZE}")
+        
+        timeout_env = os.getenv("TEXT_CHUNK_TIMEOUT")
+        if timeout_env and timeout_env.strip():
+            try:
+                self.TEXT_CHUNK_TIMEOUT = float(timeout_env.strip())
+                logger.debug(f"从环境变量读取 TEXT_CHUNK_TIMEOUT={self.TEXT_CHUNK_TIMEOUT}")
+            except ValueError:
+                logger.warning(f"环境变量 TEXT_CHUNK_TIMEOUT 值无效: {timeout_env}，使用默认值 {self.TEXT_CHUNK_TIMEOUT}")
+        
+        sentence_endings = os.getenv("TEXT_CHUNK_SENTENCE_ENDINGS")
+        if sentence_endings and sentence_endings.strip():
+            self.TEXT_CHUNK_SENTENCE_ENDINGS = sentence_endings.strip()
+            logger.debug(f"从环境变量读取 TEXT_CHUNK_SENTENCE_ENDINGS={self.TEXT_CHUNK_SENTENCE_ENDINGS}")
+        
+        # 输出最终配置（用于调试）
+        logger.info(
+            f"流式输出配置已加载: "
+            f"TEXT_CHUNK_MIN_SIZE={self.TEXT_CHUNK_MIN_SIZE}, "
+            f"TEXT_CHUNK_MAX_SIZE={self.TEXT_CHUNK_MAX_SIZE}, "
+            f"TEXT_CHUNK_TIMEOUT={self.TEXT_CHUNK_TIMEOUT}"
+        )
+
+
 # 导出实例
 LANGUAGE_CONFIG = LanguageConfig()
 TTS_CONFIG = TTSConfig()
 LLM_CONFIG = LLMConfig()
 DATABASE_CONFIG = DatabaseConfig()
 WORKFLOW_CONFIG = WorkflowConfig()
+STREAM_CONFIG = StreamConfig()

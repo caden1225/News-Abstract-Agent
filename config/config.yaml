@@ -11,7 +11,7 @@ llm:
   api_key: ${LLM_API_KEY:}
 
   # 模型配置
-  summarizer_model: Qwen2.5-7B-Instruct
+  # summarizer_model: Qwen2.5-7B-Instruct
 
   # 超时配置（秒）
   timeout: 30
@@ -29,13 +29,20 @@ llm:
   # 默认值：意图分析 500，摘要生成 2000
   max_tokens:
     # 意图分析的最大token数
-    intent: ${LLM_MAX_TOKENS_INTENT:500}
+    intent: 100
     # 摘要生成的最大token数
-    summary: ${LLM_MAX_TOKENS_SUMMARY:2000}
+    summary: 100
     # 通用最大token数（如果未指定具体类型，使用此值）
-    default: ${LLM_MAX_TOKENS_DEFAULT:2000}
-
+    default: 200
+    
 tts:
+  # TTS 服务类型选择
+  # - dashscope: 使用阿里云 DashScope TTS API（通义千问）
+  # - cosyvoice2: 使用本地 CosyVoice2 模型（默认）
+  # - mock: 使用 Mock TTS 服务（测试用）
+  # 可通过环境变量 TTS_SERVICE_TYPE 覆盖
+  service_type: ${TTS_SERVICE_TYPE:cosyvoice2}
+
   # 本地 TTS 模型配置
   # 本地模型目录路径
   # 可以是绝对路径或相对于项目根目录的路径
@@ -54,70 +61,47 @@ tts:
   default_spk_id: ${TTS_DEFAULT_SPK_ID:ko_girl}
 
   # 是否启用 TTS 服务
-  enabled: ${TTS_ENABLED:true}
+  enabled: true
 
-  # TTS 加速配置（方案C: TensorRT加速）
+  # DashScope TTS 配置（当 service_type=dashscope 时使用）
+  dashscope:
+    # API Key（优先从环境变量 DASHSCOPE_API_KEY 读取）
+    api_key: ${DASHSCOPE_API_KEY:}
+    # 模型名称
+    model: ${DASHSCOPE_MODEL:qwen3-tts-flash}
+    # 音色名称（可选值: Cherry, Alice, Bob, Diana, Echo, Frank, Grace, Henry 等）
+    voice: ${DASHSCOPE_VOICE:Cherry}
+    # 语言类型（建议与文本语种一致）
+    language_type: ${DASHSCOPE_LANGUAGE_TYPE:Chinese}
+    # API URL（支持不同地域）
+    # 北京地域: https://dashscope.aliyuncs.com/api/v1
+    # 新加坡地域: https://dashscope-intl.aliyuncs.com/api/v1
+    api_url: ${DASHSCOPE_API_URL:https://dashscope.aliyuncs.com/api/v1}
+    # 采样率（Hz）
+    sample_rate: ${DASHSCOPE_SAMPLE_RATE:24000}
+
+  # TTS 加速配置
   acceleration:
     # 是否启用 FP16 精度推理（2倍速度提升，显存减半）
     fp16: ${TTS_FP16:true}
     # 是否启用 TensorRT 加速（flow模型1.5-2倍加速）
     # 注意：需要安装TensorRT和编译engine，如果环境不支持请设为false
     tensorrt: ${TTS_TENSORRT:false}
-    # TensorRT 并发数
-    tensorrt_concurrent: ${TTS_TENSORRT_CONCURRENT:4}
-    # 是否启用 vLLM 加速（LLM部分3-5倍加速，需要额外依赖）
-    vllm: ${TTS_VLLM:false}
-    # TensorRT engine 缓存目录
-    tensorrt_cache_dir: ${TTS_TENSORRT_CACHE_DIR:null}
 
-  # Orchestrator 等待策略配置（方案B）
-  orchestrator:
-    # 等待TTS任务完成的超时时间（秒）
-    # 建议值: 30-60秒，取决于文本长度
-    max_wait_for_tts: ${TTS_MAX_WAIT_FOR_TTS:30.0}
-    # 是否启用TTS模型预热（启动时预热，降低首次请求延迟）
-    enable_warmup: ${TTS_ENABLE_WARMUP:true}
-    # 预热超时时间（秒）
-    warmup_timeout: ${TTS_WARMUP_TIMEOUT:15.0}
+  seed: 0
 
-  # 流式合成性能参数（RTF优化配置）
-  # 优化目标：RTF < 1.0（快于实时），次要目标：首音频块延迟
-  streaming:
-    # 句子缓冲区配置
-    # min_length: 最小句子长度（字符数），达到此长度且有句子结束标点时才输出
-    # RTF优化策略：增大min_length，减少短句处理，提高批处理效率
-    # - 快速响应模式: 5-10（适合实时对话，RTF可能>1.0）
-    # - 平衡模式: 15-25（适合新闻播报，RTF约0.8-1.0）
-    # - 高效模式: 25-50（适合长文本，RTF < 0.8，推荐用于RTF优化）
-    min_length: ${TTS_MIN_LENGTH:15}  # 默认: 15，平衡响应速度和效率
+  # 句子缓冲区配置（SentenceBuffer）
+  # 用于控制文本分块策略，影响 TTS 合成的流畅度和响应速度
+  buffer:
+    # 最小句子长度（字符数），达到此长度且有句子结束标点时才输出
+    # - 快速响应模式: 5-10（适合实时对话）
+    # - 平衡模式: 10-20（适合新闻播报）
+    # - 高效模式: 20-50（适合长文本朗读）
+    min_length: 15
 
-    # max_length: 最大句子长度（字符数），超过此长度会强制分割
-    # RTF优化策略：适当增大max_length，允许更长的句子批处理
-    # 建议范围: 200-400
-    max_length: ${TTS_MAX_LENGTH:300}  # RTF优化: 增大到300，允许更长句子批处理
+    max_length: 150
 
-    # max_wait_time: 最大等待时间（秒），超时后强制输出缓冲区内容
-    # RTF优化策略：适当增大max_wait_time，允许累积更多文本再处理，提高批处理效率
-    # - 快速响应: 0.5-1.0 秒（RTF可能>1.0）
-    # - 平衡模式: 1.0-2.0 秒（RTF约0.8-1.0）
-    # - 高效模式: 2.0-3.0 秒（RTF < 0.8，推荐用于RTF优化）
-    max_wait_time: ${TTS_MAX_WAIT_TIME:1.0}  # 默认: 1.0秒，平衡响应速度和效率
-
-    # token_hop_len: 输出音频块大小（token数），影响音频chunk的大小和处理效率
-    # RTF优化策略：增大token_hop_len，减少处理次数，提高整体效率
-    # - 小值(10-20): 更低延迟，但RTF通常>1.0，处理效率低
-    # - 中值(30-50): 平衡延迟和效率，RTF约0.9-1.1
-    # - 大值(60-100): 更高效率，RTF < 0.9，推荐用于RTF优化（但可能增加首音频延迟）
-    # ⚠️  重要：token_hop_len过小会导致音频时长异常膨胀和语音质量严重下降
-    token_hop_len: ${TTS_TOKEN_HOP_LEN:50}  # 默认: 50，平衡延迟和效率
-
-    # mel_cache_len: 边界平滑缓存长度（仅CosyVoice2支持）
-    # RTF优化策略：适当减小mel_cache_len，减少缓存处理开销
-    # - 大值(8-10): 更好的边界平滑，但处理开销大，RTF可能>1.0
-    # - 中值(5-7): 平衡平滑度和效率，RTF约0.9-1.0
-    # - 小值(3-5): 更高效率，RTF < 0.9，推荐用于RTF优化（可能略微影响边界平滑）
-    # 建议范围: 3-10
-    mel_cache_len: ${TTS_MEL_CACHE_LEN:3}  # 默认: 3，平衡效率和边界平滑
+    max_wait_time: 1.0
 
 # 新闻源配置
 news:
