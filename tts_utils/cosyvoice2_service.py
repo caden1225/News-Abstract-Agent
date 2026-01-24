@@ -371,7 +371,8 @@ class CosyVoice2TTS:
         text: str,
         spk_id: Optional[str] = None,
         request_id: Optional[str] = None,
-        is_last_chunk: bool = False
+        is_last_chunk: bool = False,
+        language: Optional[str] = None
     ) -> bytes:
         """
         非流式语音合成（使用inference_sft_chunked方法，保持语义连贯性）
@@ -381,6 +382,7 @@ class CosyVoice2TTS:
             spk_id: 说话人ID（可选，默认使用配置的ID）
             request_id: 请求ID，用于跨 chunk 的 session 管理，保证音色一致性
             is_last_chunk: 是否为最后一个 chunk，用于决定是否清理 session
+            language: 语言代码（可选，CosyVoice2 暂不使用此参数）
         
         Returns:
             PCM音频数据

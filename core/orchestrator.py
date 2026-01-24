@@ -717,8 +717,12 @@ class NewsAgentOrchestrator:
                     except asyncio.QueueEmpty:
                         pending_chunk = None
                     
-                    # 调用TTS引擎
-                    audio_bytes = await tts_service.synthesize(text=text_chunk, spk_id=None)
+                    # 调用TTS引擎，传递语言参数
+                    audio_bytes = await tts_service.synthesize(
+                        text=text_chunk, 
+                        spk_id=None,
+                        language=tts_language
+                    )
                     
                     # 送入分块器进行8KB切割
                     new_chunks = chunker.add_audio(audio_bytes)
